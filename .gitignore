@@ -1,0 +1,47 @@
+# Build outputs
+dist/
+build/
+*.spec
+
+# Executables
+*.exe
+*.pkg
+
+# YOLO model files (downloaded automatically at runtime)
+*.pt
+
+# ffmpeg (downloaded automatically during build)
+ffmpeg.exe
+ffmpeg_dl.zip
+ffmpeg.zip
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# User settings
+.faceblur_settings.json
+
+# Temp files created during processing
+*.tmp_raw.avi
+*.tmp_raw.mp4
+*.tmp_muted.mp4
+
+# Installer output
+installer_output/
+
+# VS Code
+.vscode/
+
+# Conda / Python env
+*.egg-info/
+.env
+env/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
