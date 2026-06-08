@@ -1607,6 +1607,76 @@ class SplashScreen(tk.Tk):
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════
 
+def _torch_is_installed():
+    """Check if torch is available."""
+    try:
+        import torch
+        return True
+    except ImportError:
+        return False
+
+def _install_torch_first_run(splash):
+    """
+    Detect GPU and install correct torch on first run.
+    Returns gpu_info dict after installation.
+    """
+    import subprocess, sys, shutil
+
+    splash.set_status("Detecting GPU...", 0.15)
+
+    # Detect CUDA via nvidia-smi
+    cuda_ver = None
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        # Check common paths
+        for p in [r"C:\Windows\System32\nvidia-smi.exe",
+                  r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"]:
+            if os.path.exists(p):
+                smi = p
+                break
+
+    if smi:
+        try:
+            import re
+            out = subprocess.check_output([smi], text=True, timeout=5)
+            m = re.search(r"CUDA Version:\s*(\d+\.\d+)", out)
+            if m:
+                cuda_ver = m.group(1)
+        except Exception:
+            pass
+
+    # Pick correct torch index URL
+    ver = float(cuda_ver) if cuda_ver else 0
+    if ver >= 12.1:
+        index = "https://download.pytorch.org/whl/cu121"
+        label = "GPU (CUDA {})".format(cuda_ver)
+    elif ver >= 11.8:
+        index = "https://download.pytorch.org/whl/cu118"
+        label = "GPU (CUDA {})".format(cuda_ver)
+    else:
+        index = "https://download.pytorch.org/whl/cpu"
+        label = "CPU only"
+
+    splash.set_status("Installing torch ({})...".format(label), 0.3)
+
+    # Install torch using current python executable
+    python = sys.executable
+    cmd = [python, "-m", "pip", "install", "torch", "torchvision",
+           "--index-url", index, "-q"]
+
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+
+    try:
+        subprocess.run(cmd, timeout=300, **kwargs)
+    except Exception:
+        pass  # If install fails, fall back to CPU
+
+    splash.set_status("Finalizing...", 0.8)
+    return detect_gpu()
+
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()
 
@@ -1622,8 +1692,14 @@ if __name__ == "__main__":
     _loaded = {}
 
     def _background_load():
-        splash.set_status("Detecting GPU...", 0.5)
-        _loaded["gpu_info"] = detect_gpu()
+        # First run: torch not installed yet — install it now
+        if not _torch_is_installed():
+            splash.set_status("First run setup...", 0.1)
+            _loaded["gpu_info"] = _install_torch_first_run(splash)
+        else:
+            splash.set_status("Detecting GPU...", 0.5)
+            _loaded["gpu_info"] = detect_gpu()
+
         splash.set_status("Ready.", 0.9)
         splash.after(0, _launch_app)
 

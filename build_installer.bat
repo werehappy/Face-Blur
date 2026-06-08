@@ -72,7 +72,7 @@ if errorlevel 1 (
 )
 taskkill /f /im FACEBLUR_CPU.exe >nul 2>&1
 if exist "%~dp0dist\FACEBLUR_CPU.exe" del /f /q "%~dp0dist\FACEBLUR_CPU.exe"
-"%CONDA_PREFIX%\Scripts\pyinstaller.exe" --onefile --noconsole --clean --collect-data ultralytics --hidden-import ultralytics --add-data "ffmpeg.exe;." --name FACEBLUR_CPU %SCRIPT%
+"%CONDA_PREFIX%\Scripts\pyinstaller.exe" --onefile --noconsole --clean --collect-data ultralytics --hidden-import ultralytics --exclude-module torch --exclude-module torchvision --add-data "ffmpeg.exe;." --name FACEBLUR_CPU %SCRIPT%
 if errorlevel 1 (
     echo [ERROR] CPU build failed.
     pause
@@ -96,7 +96,7 @@ if errorlevel 1 (
 )
 taskkill /f /im FACEBLUR_GPU.exe >nul 2>&1
 if exist "%~dp0dist\FACEBLUR_GPU.exe" del /f /q "%~dp0dist\FACEBLUR_GPU.exe"
-"%CONDA_PREFIX%\Scripts\pyinstaller.exe" --onefile --noconsole --clean --collect-data ultralytics --hidden-import ultralytics --add-data "ffmpeg.exe;." --name FACEBLUR_GPU %SCRIPT%
+"%CONDA_PREFIX%\Scripts\pyinstaller.exe" --onefile --noconsole --clean --collect-data ultralytics --hidden-import ultralytics --exclude-module torch --exclude-module torchvision --add-data "ffmpeg.exe;." --name FACEBLUR_GPU %SCRIPT%
 if errorlevel 1 (
     echo [ERROR] GPU build failed.
     pause

@@ -48,7 +48,8 @@ if errorlevel 1 (
     if exist "%~dp0install_torch.ps1" (
         powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install_torch.ps1" "%CONDA_PREFIX%\Scripts\pip.exe"
     )
-    "%CONDA_PREFIX%\Scripts\pip.exe" install ultralytics opencv-python numpy pyinstaller dill win10toast pillow
+    "%CONDA_PREFIX%\Scripts\pip.exe" install opencv-python numpy pyinstaller dill win10toast pillow
+:: Note: torch is NOT pre-installed - it installs at first run based on user GPU
     if errorlevel 1 ( echo [ERROR] pip install failed. & pause & exit /b 1 )
 ) else (
     echo       All packages present, skipping install.
@@ -83,6 +84,8 @@ if exist "%~dp0dist\FACEBLUR.exe" del /f /q "%~dp0dist\FACEBLUR.exe"
     --hidden-import ultralytics ^
     --hidden-import PIL ^
     --hidden-import win10toast ^
+    --exclude-module torch ^
+    --exclude-module torchvision ^
     --add-data "ffmpeg.exe;." ^
     --name FACEBLUR %SCRIPT%
 
