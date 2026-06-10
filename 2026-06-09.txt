@@ -1,0 +1,48 @@
+Here's the full recap, then a prioritized set of improvements.
+
+## What we did today
+
+**Problem 1 — the app was dead.** Your then-current `face_blur.py` tried to install torch at runtime with `sys.executable -m pip install …`. In a PyInstaller `--onefile` exe, `sys.executable` is the exe itself, not a Python interpreter, so that command installs nothing — torch never arrived and the app couldn't run. We rolled back to your backup's saner design.
+
+**Problem 2 — making the installer small.** We settled on an architecture that ships:
+- one small exe with torch *excluded*,
+- a ~10 MB embeddable Python bundled in a `faceblur_env` folder,
+- and torch downloaded once on first launch, sized to the user's actual GPU.
+
+To make that real we wired up the disconnected helpers (`get_python_executable`, `_install_torch_first_run`), added `importlib.invalidate_caches()` so torch works in the same session it's installed, created `download_embed_python.ps1`, and rewrote `installer.iss` and `build_installer.bat` for a single build.
+
+**Problem 3 — GPU not detected.** Your screenshot showed CPU torch installed despite an Nvidia GPU. Cause: `detect_gpu()` only set a CUDA version if it could parse it from nvidia-smi, and when that parse came up empty the logic silently fell back to the CPU wheel. Plus the "Enable GPU" button had been deleted from the UI, so there was no recovery. We added `_pick_torch_index()` (GPU present but unknown CUDA → assume modern, install cu121), threaded `has_nvidia` through, and restored the **ENABLE GPU** button.
+
+Net result: tiny installer, torch auto-installed correctly for the hardware, with a one-click fallback.
+
+## Suggested improvements
+
+**Boot speed (biggest single win)**
+- Switch from `--onefile` to `--onedir`. Onefile unpacks the whole bundle to a temp folder on *every* launch — that's most of your startup delay. Onedir starts noticeably faster and you already ship an installer, so a folder of files is no inconvenience to the user. This is the highest impact, lowest risk change.
+
+**Installer / download size**
+- Swap `opencv-python` for the **headless** variant (`-headless` build). It drops the GUI/highgui code you don't use and is meaningfully smaller. Caveat to verify: your CSRT tracker lives in opencv-*contrib*, so you'd want `opencv-contrib-python-headless`, and test that tracking still imports.
+- Exclude more dead weight in the build. ultralytics drags in matplotlib, pandas, scipy, seaborn, etc. that an inference-only app usually doesn't need. Try adding `--exclude-module matplotlib --exclude-module pandas --exclude-module scipy` and test — this can shave a lot, but verify the app still runs since ultralytics imports some of these lazily.
+- Consider downloading **ffmpeg** on first run too, the same way torch is now handled. ffmpeg.exe is often 70–100 MB; moving it out of the installer would shrink it further. Tradeoff: another first-run download.
+
+**Faster processing / runtime**
+- Pipeline the work: decode frames on one thread, run YOLO on another, write on a third (producer/consumer queues). Right now decode → infer → write is likely serial, so the GPU sits idle during I/O.
+- Batch frames into a single YOLO call instead of one-at-a-time. GPUs are far more efficient with a batch dimension; combined with your frame-skip this can be a big throughput gain.
+- Avoid the double encode. Your pipeline writes XVID then re-encodes to H.264 with ffmpeg. Piping raw frames straight into ffmpeg once (rawvideo over stdin) skips writing/re-reading an intermediate file.
+- For Nvidia users, an ONNX or TensorRT export of the model (ultralytics supports `model.export`) can speed inference substantially — higher effort, and adds build complexity, so treat it as a later optimization.
+
+**UI polish**
+- Fix the version string: line ~569 hardcodes `"v1.0"` while your `VERSION` constant is `"1.0.1"`. Point the label at `VERSION` so it can't drift again.
+- Add high-DPI awareness (a small `ctypes` call to `SetProcessDpiAwareness` at startup). On scaled Windows displays, Tkinter apps render blurry without it.
+- Improve the first-run feedback. The torch download is multi-minute behind a generic "Installing libraries…". Parsing pip's progress into a real progress bar (or at least "downloading torch, ~2 GB, this happens once") would make it feel far less like a hang.
+- Knock out the known issues in your README while you're in there — the slider visual refresh and toast reliability.
+
+**Distribution robustness**
+- Code-sign the exe. Unsigned PyInstaller onefile binaries reliably trigger SmartScreen "unknown publisher" warnings and sometimes antivirus false positives — a real friction point for users. Signing (and onedir) both help.
+- Log the detected driver/CUDA version on startup. That one line makes "why is it on CPU?" self-diagnosing next time. (I offered this earlier — still happy to add it.)
+
+## If I had to pick three
+
+Do `--onedir` (boot speed), the opencv-headless + module-exclude pass (size), and the version-string + DPI fixes (cheap UI wins). The processing-pipeline work is the highest-value performance change but also the most involved, so it's a good "phase two."
+
+Want me to implement any of these now? The `--onedir` switch, the exclude flags, the version-string fix, and the DPI-awareness line are all quick and low-risk — I can do them together and hand you updated files.

@@ -32,6 +32,10 @@ __pycache__/
 # Installer output
 installer_output/
 
+Face-Blur/
+
+faceblur_env/
+
 # VS Code
 .vscode/
 

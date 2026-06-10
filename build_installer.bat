@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 echo.
 echo ==================================================
-echo   FACEBLUR  --  Build Installer
+echo   FACEBLUR  --  Build Installer (small / no torch bundled)
 echo ==================================================
 echo.
 
@@ -39,7 +39,7 @@ echo       Using env: %CONDA_PREFIX%
 
 cd /d "%~dp0"
 
-:: Check ffmpeg
+:: ffmpeg
 if not exist "%~dp0%FFMPEG_EXE%" (
     if not exist "%~dp0download_ffmpeg.ps1" (
         echo [ERROR] download_ffmpeg.ps1 not found.
@@ -56,53 +56,86 @@ if not exist "%~dp0%FFMPEG_EXE%" (
 )
 echo       ffmpeg OK.
 
-:: Step 0: Install common packages
+:: Step 0: Build-env packages.
+:: NOTE: we install CPU torch in the BUILD env only so PyInstaller can analyze
+:: ultralytics. torch is then EXCLUDED from the exe, so it is never bundled.
 echo.
-echo [0/4] Installing common packages...
-"%CONDA_PREFIX%\Scripts\pip.exe" install ultralytics opencv-python numpy pyinstaller dill win10toast pillow
+echo [0/4] Installing build packages...
+:: Hold numpy<2 across EVERY pip install in this build (incl. torch and the
+:: GPU install_torch.ps1). opencv/torch wheels here are built for numpy 1.x;
+:: letting numpy 2.x in crashes them and makes PyInstaller drop cv2. A pip
+:: constraints file keeps the resolver from ever picking numpy 2.x, so numpy
+:: is not deleted and re-downloaded on each build.
+:: Relative path: pip splits PIP_CONSTRAINT on spaces, and the project path
+:: may contain spaces. CWD is already this folder (cd above), so relative works.
+>constraints.txt echo numpy^<2
+set PIP_CONSTRAINT=constraints.txt
 
-:: Step 1: Build CPU version
-echo.
-echo [1/4] Building CPU version...
-"%CONDA_PREFIX%\Scripts\pip.exe" install torch torchvision --index-url https://download.pytorch.org/whl/cpu --upgrade -q
-if errorlevel 1 (
-    echo [ERROR] CPU torch install failed.
-    pause
-    exit /b 1
-)
-taskkill /f /im FACEBLUR_CPU.exe >nul 2>&1
-if exist "%~dp0dist\FACEBLUR_CPU.exe" del /f /q "%~dp0dist\FACEBLUR_CPU.exe"
-"%CONDA_PREFIX%\Scripts\pyinstaller.exe" --onefile --noconsole --clean --collect-data ultralytics --hidden-import ultralytics --exclude-module torch --exclude-module torchvision --add-data "ffmpeg.exe;." --name FACEBLUR_CPU %SCRIPT%
-if errorlevel 1 (
-    echo [ERROR] CPU build failed.
-    pause
-    exit /b 1
-)
-echo       CPU exe ready.
+:: One clean opencv (CONTRIB build, for cv2.legacy.TrackerCSRT).
+"%CONDA_PREFIX%\Scripts\pip.exe" uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless >nul 2>&1
+"%CONDA_PREFIX%\Scripts\pip.exe" install ultralytics pyinstaller dill win10toast pillow
+if errorlevel 1 ( echo [ERROR] package install failed. & pause & exit /b 1 )
+:: CPU torch in the BUILD env only (so PyInstaller can analyze ultralytics).
+:: torch is EXCLUDED from the exe.
+"%CONDA_PREFIX%\Scripts\pip.exe" install torch torchvision --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple -q
+:: opencv-contrib LAST (force) so its cv2 - including cv2.legacy - overrides
+:: the opencv-python that ultralytics pulls in as a dependency.
+:: ultralytics pulls in opencv-python; remove it so only the CONTRIB build is
+:: registered. Two opencv distros over the same cv2 folder confuses
+:: PyInstaller and makes it drop cv2 from the exe.
+"%CONDA_PREFIX%\Scripts\pip.exe" uninstall -y opencv-python opencv-python-headless >nul 2>&1
+"%CONDA_PREFIX%\Scripts\pip.exe" install --force-reinstall --no-deps opencv-contrib-python
 
-:: Step 2: Build GPU version
+:: Verify cv2 imports BEFORE building. If it cannot, PyInstaller silently
+:: drops it and the exe dies at runtime with "No module named cv2".
+echo       Verifying opencv...
+"%CONDA_PREFIX%\python.exe" -c "import numpy,cv2; cv2.legacy.TrackerCSRT_create; print('cv2',cv2.__version__,'numpy',numpy.__version__)"
+if errorlevel 1 (
+    echo [ERROR] cv2 failed to import/verify in the build env.
+    echo         Run:  pip install "numpy^<2" opencv-contrib-python   then retry.
+    pause
+    exit /b 1
+)
+
+:: Step 1: Build the single small exe (torch excluded)
 echo.
-echo [2/4] Building GPU version...
-if not exist "%~dp0install_torch.ps1" (
-    echo [ERROR] install_torch.ps1 not found.
-    pause
-    exit /b 1
-)
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install_torch.ps1" "%CONDA_PREFIX%\Scripts\pip.exe"
+echo [1/4] Building FACEBLUR.exe (torch excluded)...
+taskkill /f /im FACEBLUR.exe >nul 2>&1
+if exist "%~dp0dist\FACEBLUR.exe" del /f /q "%~dp0dist\FACEBLUR.exe"
+"%CONDA_PREFIX%\Scripts\pyinstaller.exe" --onefile --noconsole --clean ^
+    --collect-data ultralytics ^
+    --hidden-import ultralytics ^
+    --hidden-import PIL ^
+    --hidden-import win10toast ^
+    --hidden-import pickletools ^
+    --hidden-import html.parser ^
+    --collect-all cv2 ^
+    --exclude-module torch ^
+    --exclude-module torchvision ^
+    --add-data "ffmpeg.exe;." ^
+    --name FACEBLUR %SCRIPT%
 if errorlevel 1 (
-    echo [ERROR] GPU torch install failed.
+    echo [ERROR] Build failed.
     pause
     exit /b 1
 )
-taskkill /f /im FACEBLUR_GPU.exe >nul 2>&1
-if exist "%~dp0dist\FACEBLUR_GPU.exe" del /f /q "%~dp0dist\FACEBLUR_GPU.exe"
-"%CONDA_PREFIX%\Scripts\pyinstaller.exe" --onefile --noconsole --clean --collect-data ultralytics --hidden-import ultralytics --exclude-module torch --exclude-module torchvision --add-data "ffmpeg.exe;." --name FACEBLUR_GPU %SCRIPT%
+echo       FACEBLUR.exe ready.
+
+:: Step 2: Prepare bundled embeddable Python (pip-capable, no torch)
+echo.
+echo [2/4] Preparing bundled Python (faceblur_env)...
+if not exist "%~dp0download_embed_python.ps1" (
+    echo [ERROR] download_embed_python.ps1 not found.
+    pause
+    exit /b 1
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0download_embed_python.ps1"
 if errorlevel 1 (
-    echo [ERROR] GPU build failed.
+    echo [ERROR] Embeddable Python prep failed.
     pause
     exit /b 1
 )
-echo       GPU exe ready.
+echo       faceblur_env ready.
 
 :: Step 3: Check Inno Setup
 echo.
@@ -131,6 +164,7 @@ echo.
 echo ==================================================
 echo   Done!
 echo   Distribute: %~dp0installer_output\FACEBLUR_Setup.exe
+echo   (torch downloads on the user's first launch)
 echo ==================================================
 echo.
 pause

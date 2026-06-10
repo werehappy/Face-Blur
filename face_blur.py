@@ -13,12 +13,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 # Version
-VERSION = "1.0"
+VERSION = "1.0.1"
 
 # Settings persistence
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".faceblur_settings.json")
 
-SETTINGS_VERSION = "1.0"
+SETTINGS_VERSION = "1.0.1"
 
 def load_settings():
     try:
@@ -99,12 +99,18 @@ def get_python_executable():
     # or in a standard relative path
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(sys.executable)
-        # Try common locations relative to the exe
+        venv = _get_venv_path()
+        # Prefer the bundled embeddable python inside faceblur_env.
+        # This is the python the installer ships; pip-installing with it
+        # places torch into faceblur_env\Lib\site-packages, which
+        # _add_venv_to_path() then injects into sys.path.
         candidates = [
+            os.path.join(venv, "python.exe"),
+            os.path.join(venv, "Scripts", "python.exe"),
             os.path.join(exe_dir, "python.exe"),
             os.path.join(exe_dir, "_internal", "python.exe"),
         ]
-        # Also check CONDA_PREFIX if set
+        # Also check CONDA_PREFIX if set (useful when running from source)
         conda = os.environ.get("CONDA_PREFIX", "")
         if conda:
             candidates.insert(0, os.path.join(conda, "python.exe"))
@@ -120,20 +126,32 @@ def get_python_executable():
     else:
         return sys.executable
 
-def install_torch_for_cuda(cuda_ver, log_fn=None):
+def _pick_torch_index(cuda_ver, has_nvidia):
+    """
+    Choose the right torch wheel index for the user's hardware.
+    Returns (index_url, human_label).
+    Key fix: an Nvidia GPU whose CUDA version we could not parse should still
+    get a CUDA build (assume a modern driver) instead of silently falling back
+    to CPU, which is what left users on 'GPU available - not enabled'.
+    """
+    ver = float(cuda_ver) if cuda_ver else 0
+    if ver >= 12.1:
+        return "https://download.pytorch.org/whl/cu121", "CUDA 12.1+"
+    if ver >= 11.8:
+        return "https://download.pytorch.org/whl/cu118", "CUDA 11.8"
+    if has_nvidia and ver == 0:
+        # GPU present but CUDA version unknown -> assume a modern driver.
+        return "https://download.pytorch.org/whl/cu121", "CUDA (version unknown, assuming 12.x)"
+    if has_nvidia:
+        # GPU present but driver/CUDA genuinely too old for current torch.
+        return "https://download.pytorch.org/whl/cpu", "CPU (CUDA too old)"
+    return "https://download.pytorch.org/whl/cpu", "CPU"
+
+def install_torch_for_cuda(cuda_ver, log_fn=None, has_nvidia=False):
     """Install correct torch build using the real Python executable."""
     import subprocess, sys
 
-    ver = float(cuda_ver) if cuda_ver else 0
-    if ver >= 12.1:
-        index = "https://download.pytorch.org/whl/cu121"
-        label = "CUDA 12.1+"
-    elif ver >= 11.8:
-        index = "https://download.pytorch.org/whl/cu118"
-        label = "CUDA 11.8"
-    else:
-        index = "https://download.pytorch.org/whl/cpu"
-        label = "CPU (CUDA too old)"
+    index, label = _pick_torch_index(cuda_ver, has_nvidia)
 
     if log_fn:
         log_fn("Installing torch for {}...\n".format(label), "accent")
@@ -147,9 +165,28 @@ def install_torch_for_cuda(cuda_ver, log_fn=None):
     if log_fn:
         log_fn("  Using Python: {}\n".format(python_exe), "dim")
 
+    # Pin numpy to the exact version baked into the exe. torch otherwise pulls
+    # whatever numpy it likes (often a newer major version), and having two
+    # binary-incompatible numpys reachable crashes the app natively at import
+    # (the console just vanishes). Matching versions removes that conflict.
+    np_pin = None
+    try:
+        import numpy as _np_v
+        np_pin = _np_v.__version__
+    except Exception:
+        pass
+
     cmd = [python_exe, "-m", "pip", "install",
-           "torch", "torchvision",
-           "--index-url", index, "--upgrade"]
+           "torch", "torchvision"]
+    if np_pin:
+        cmd.append("numpy=={}".format(np_pin))
+    cmd += ["--index-url", index,
+            # IMPORTANT: do NOT add --extra-index-url pypi here. With both
+            # indexes, pip pulls torch from PyPI (the Windows wheel there is
+            # CPU-only) instead of the +cuXXX build from the PyTorch index.
+            # The PyTorch index is self-contained for torch and its deps.
+            # force a clean swap (e.g. CPU build -> CUDA build).
+            "--force-reinstall", "--no-cache-dir"]
 
     # CREATE_NO_WINDOW prevents a new console window on Windows
     kwargs = {}
@@ -535,7 +572,7 @@ FV = ("Courier New", 11, "bold")
 class App(tk.Tk):
     def __init__(self, gpu_info=None):
         super().__init__()
-        self.title("FACEBLUR v1.0")
+        self.title("FACEBLUR v1.0.1")
         self.configure(bg=BG)
         self.geometry("960x780")
         self.minsize(900, 700)
@@ -566,11 +603,11 @@ class App(tk.Tk):
         top.pack(fill="x", padx=20, pady=(16, 0))
         tk.Label(top, text="FACEBLUR", bg=BG, fg=ACCENT, font=FH).pack(side="left")
         tk.Label(top, text="YOLOv8 face censoring", bg=BG, fg=TDIM, font=FS).pack(side="left", padx=12)
-        tk.Label(top, text="v1.0", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left")
+        tk.Label(top, text="v1.0.1", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left")
         tk.Label(top, text="made by werehappy", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left", padx=4)
         # GPU/CPU indicator (right side of top bar)
         if self._gpu_info["torch_cuda"]:
-            device_text  = "GPU: " + self._gpu_info["gpu_name"]
+            device_text  = "GPU: " + (self._gpu_info.get("gpu_name") or "CUDA device")
             device_color = SUCCESS
         elif self._gpu_info["has_nvidia"]:
             device_text  = "GPU available — not enabled"
@@ -581,9 +618,15 @@ class App(tk.Tk):
         self._device_lbl = tk.Label(top, text=device_text, bg=BG,
                                     fg=device_color, font=FL)
         self._device_lbl.pack(side="right")
+        # Recovery path: GPU present but no CUDA torch -> let the user install
+        # the GPU build into faceblur_env with one click (no reinstall needed).
+        self._enable_gpu_btn = None
+        if self._gpu_info["has_nvidia"] and not self._gpu_info["torch_cuda"]:
+            self._enable_gpu_btn = self._btn(top, "ENABLE GPU",
+                                             self._enable_gpu, accent=True)
+            self._enable_gpu_btn.pack(side="right", padx=(0, 10))
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=20, pady=(10, 0))
 
-        # GPU banner removed - installer handles GPU/CPU version selection
         self._gpu_banner = None
 
         # ── MAIN AREA ──
@@ -1140,7 +1183,8 @@ class App(tk.Tk):
         gi = self._gpu_info
 
         def _do():
-            success = install_torch_for_cuda(gi["cuda_ver"], log_fn=self._write_log)
+            success = install_torch_for_cuda(gi["cuda_ver"], log_fn=self._write_log,
+                                             has_nvidia=gi.get("has_nvidia", False))
             if success:
                 try:
                     import importlib, torch
@@ -1581,7 +1625,7 @@ class SplashScreen(tk.Tk):
         inner.pack(fill="both", expand=True)
         tk.Label(inner, text="FACEBLUR", bg="#0f0f0f", fg="#00e5ff",
                  font=("Courier New", 32, "bold")).pack(pady=(30, 4))
-        tk.Label(inner, text="YOLOv8 face censoring  v1.0  |  made by werehappy",
+        tk.Label(inner, text="YOLOv8 face censoring  v1.0.1  |  made by werehappy",
                  bg="#0f0f0f", fg="#444444",
                  font=("Courier New", 9)).pack()
         self._status = tk.Label(inner, text="Starting...",
@@ -1595,7 +1639,69 @@ class SplashScreen(tk.Tk):
         self._pb.place(x=0, y=0, width=0, height=3)
         self._pb_width = 340
 
+        # The splash is borderless (no X) and topmost. If loading ever fails,
+        # it must still be closeable instead of floating forever.
+        self._closed = False
+        self._err_btn = None
+        self.bind("<Escape>", lambda e: self.close())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self._close_x = tk.Label(inner, text="\u2715", bg="#0f0f0f",
+                                 fg="#444444", font=("Courier New", 11, "bold"),
+                                 cursor="hand2")
+        self._close_x.place(relx=1.0, x=-12, y=8, anchor="ne")
+        self._close_x.bind("<Button-1>", lambda e: self.close())
+
+    def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        try:
+            self.quit()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+    def show_error(self, msg):
+        """Convert the borderless splash into a normal, closeable window so the
+        user can read the failure and dismiss it (no more floating ghost)."""
+        try:
+            self.overrideredirect(False)
+            self.attributes("-topmost", False)
+            self.title("FACEBLUR - startup error")
+        except Exception:
+            pass
+        try:
+            self._status.config(text=msg, fg="#ff6b8a")
+        except Exception:
+            pass
+        if not self._err_btn:
+            try:
+                self._err_btn = tk.Label(self, text="CLOSE", bg="#ff6b8a",
+                                         fg="#0f0f0f", cursor="hand2",
+                                         font=("Courier New", 10, "bold"),
+                                         padx=16, pady=6)
+                self._err_btn.bind("<Button-1>", lambda e: self.close())
+                self._err_btn.place(relx=0.5, rely=1.0, y=-14, anchor="s")
+            except Exception:
+                pass
+        try:
+            self.update()
+        except Exception:
+            pass
+
+    def report_callback_exception(self, exc, val, tb):
+        # Tk swallows exceptions raised inside callbacks (e.g. our after()-
+        # scheduled launch). Capture them and surface a closeable error window.
+        import traceback
+        _append_crash("".join(traceback.format_exception(exc, val, tb)))
+        self.show_error("Startup error - see faceblur_crash.txt")
+
     def set_status(self, msg, pct):
+        if getattr(self, "_closed", False):
+            return
         self._status.config(text=msg)
         self._pb.place(x=0, y=0,
                        width=int(self._pb_width * max(0.0, min(1.0, pct))),
@@ -1607,81 +1713,216 @@ class SplashScreen(tk.Tk):
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════
 
+def _get_venv_path():
+    """Get path to the faceblur venv next to the exe."""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "faceblur_env")
+
+def _add_venv_to_path():
+    """Add the faceblur venv site-packages to sys.path so torch is importable."""
+    venv = _get_venv_path()
+    _log = ["Venv path: {}".format(venv),
+            "Venv exists: {}".format(os.path.exists(venv))]
+
+    if not os.path.exists(venv):
+        _write_debug(_log)
+        return False
+
+    # Walk the entire venv to find site-packages regardless of structure
+    found = False
+    for root, dirs, files in os.walk(venv):
+        if os.path.basename(root) == "site-packages":
+            if root not in sys.path:
+                sys.path.insert(0, root)
+                _log.append("Added: {}".format(root))
+            else:
+                _log.append("Already on path: {}".format(root))
+            found = True   # present on path counts as found
+
+    # Also add Scripts/bin for DLLs
+    for scripts_dir in ["Scripts", "bin"]:
+        sp = os.path.join(venv, scripts_dir)
+        if os.path.exists(sp) and sp not in sys.path:
+            sys.path.insert(0, sp)
+            _log.append("Added scripts: {}".format(sp))
+
+    # The exe only bundles the stdlib modules OUR code uses. torch pulls in
+    # extra stdlib modules (e.g. pickletools) that the frozen exe lacks, which
+    # makes "import torch" fail. The bundled embeddable Python here ships the
+    # FULL stdlib (in python3XX.zip), so add it as a fallback. Appended, not
+    # inserted, so the exe's own (version-matched) stdlib always wins and the
+    # zip only fills genuine gaps.
+    import glob
+    for z in sorted(glob.glob(os.path.join(venv, "python3*.zip"))):
+        if z not in sys.path:
+            sys.path.append(z)
+            _log.append("Added stdlib zip: {}".format(z))
+    for extra in (venv, os.path.join(venv, "DLLs"), os.path.join(venv, "Lib")):
+        if os.path.isdir(extra) and extra not in sys.path:
+            sys.path.append(extra)
+            _log.append("Added stdlib dir: {}".format(extra))
+
+    _log.append("Result: {}".format("found" if found else "site-packages not found"))
+    _write_debug(_log)
+    return found
+
+def _write_debug(lines):
+    try:
+        base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+               else os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(base, "faceblur_debug.txt"), "w") as f:
+            f.write("\n".join(lines))
+    except Exception:
+        pass
+
+def _crash_log_path():
+    try:
+        base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+               else os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base, "faceblur_crash.txt")
+    except Exception:
+        return "faceblur_crash.txt"
+
+def _append_crash(text):
+    try:
+        import datetime
+        with open(_crash_log_path(), "a") as f:
+            f.write("\n=== {} ===\n{}\n".format(
+                datetime.datetime.now().isoformat(), text))
+    except Exception:
+        pass
+
 def _torch_is_installed():
-    """Check if torch is available."""
+    """Check if torch is available, including from venv."""
+    _add_venv_to_path()
     try:
         import torch
         return True
-    except ImportError:
+    except Exception:
+        # Log the reason: if this keeps failing in the frozen exe, the app
+        # reinstalls torch on every launch (slow boot). The trace tells us why.
+        import traceback
+        _append_crash("torch import check failed (would trigger reinstall):\n"
+                      + traceback.format_exc())
         return False
 
 def _install_torch_first_run(splash):
     """
-    Detect GPU and install correct torch on first run.
-    Returns gpu_info dict after installation.
+    First launch only: torch is not bundled in the exe (keeps the download
+    small). We detect the GPU, then use the bundled embeddable Python in
+    faceblur_env to pip-install the matching torch build into
+    faceblur_env\\Lib\\site-packages. After this, _add_venv_to_path() makes
+    it importable for every future launch, so this runs exactly once.
+    Requires an internet connection on first run.
     """
-    import subprocess, sys, shutil
+    import time
 
-    splash.set_status("Detecting GPU...", 0.15)
-
-    # Detect CUDA via nvidia-smi
-    cuda_ver = None
-    smi = shutil.which("nvidia-smi")
-    if not smi:
-        # Check common paths
-        for p in [r"C:\Windows\System32\nvidia-smi.exe",
-                  r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"]:
-            if os.path.exists(p):
-                smi = p
-                break
-
-    if smi:
+    _log = []
+    def _status(msg, pct):
+        _log.append(msg)
         try:
-            import re
-            out = subprocess.check_output([smi], text=True, timeout=5)
-            m = re.search(r"CUDA Version:\s*(\d+\.\d+)", out)
-            if m:
-                cuda_ver = m.group(1)
+            splash.set_status(msg, pct)
         except Exception:
             pass
 
-    # Pick correct torch index URL
-    ver = float(cuda_ver) if cuda_ver else 0
-    if ver >= 12.1:
-        index = "https://download.pytorch.org/whl/cu121"
-        label = "GPU (CUDA {})".format(cuda_ver)
-    elif ver >= 11.8:
-        index = "https://download.pytorch.org/whl/cu118"
-        label = "GPU (CUDA {})".format(cuda_ver)
+    # Make sure the bundled python is reachable before we try to use it.
+    python_exe = get_python_executable()
+    if python_exe is None:
+        _status("Setup error: bundled Python not found.", 0.5)
+        _write_debug(["_install_torch_first_run: get_python_executable() returned None",
+                      "venv path: {}".format(_get_venv_path())])
+        time.sleep(4)
+        return detect_gpu()
+
+    _status("First run: detecting GPU...", 0.2)
+    gpu = detect_gpu()
+    cuda_ver = gpu.get("cuda_ver")
+    if gpu.get("has_nvidia") and cuda_ver:
+        _status("Downloading GPU libraries (one-time, a few minutes)...", 0.35)
     else:
-        index = "https://download.pytorch.org/whl/cpu"
-        label = "CPU only"
+        _status("Downloading libraries (one-time, a few minutes)...", 0.35)
 
-    splash.set_status("Installing torch ({})...".format(label), 0.3)
+    # install_torch_for_cuda() uses get_python_executable() internally and
+    # streams pip output through this callback.
+    def _pip_log(line, tag=None):
+        _log.append(line.rstrip("\n"))
+        # Keep the splash bar gently moving while pip works.
+        _status("Installing libraries...", 0.55)
 
-    # Install torch using current python executable
-    python = sys.executable
-    cmd = [python, "-m", "pip", "install", "torch", "torchvision",
-           "--index-url", index, "-q"]
-
-    kwargs = {}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-
+    ok = False
     try:
-        subprocess.run(cmd, timeout=300, **kwargs)
-    except Exception:
-        pass  # If install fails, fall back to CPU
+        ok = install_torch_for_cuda(cuda_ver, log_fn=_pip_log,
+                                    has_nvidia=gpu.get("has_nvidia", False))
+    except Exception as e:
+        _log.append("install_torch_for_cuda raised: {}".format(e))
+        ok = False
 
-    splash.set_status("Finalizing...", 0.8)
+    _write_debug(_log)
+
+    if not ok:
+        _status("Could not install libraries. Check your internet "
+                "connection and relaunch.", 0.6)
+        time.sleep(5)
+        # Return whatever we know; the app will report torch missing.
+        return detect_gpu()
+
+    # Make the freshly installed packages importable in THIS process.
+    # The site-packages dir was already on sys.path (added empty at startup),
+    # so the path-finder cache is stale - invalidate it before importing torch.
+    _status("Finalizing...", 0.8)
+    _add_venv_to_path()
+    try:
+        import importlib
+        importlib.invalidate_caches()
+    except Exception:
+        pass
+
+    # Re-detect now that torch is importable (picks up torch.cuda state).
     return detect_gpu()
 
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
 
-    import cv2 as _cv2
-    import numpy as _np
+    # ---- crash diagnostics -------------------------------------------------
+    # The console can vanish on a native crash (e.g. a numpy/torch ABI clash),
+    # leaving no trace. Dump native faults to a file next to the exe.
+    try:
+        import faulthandler
+        _crash_fp = open(_crash_log_path(), "w")
+        faulthandler.enable(file=_crash_fp)
+    except Exception:
+        _crash_fp = None
+
+    # Inject venv site-packages so torch installed by installer is found
+    _add_venv_to_path()
+
+    # cv2/numpy are bundled in the exe. If a build ever ships without them,
+    # log the real error and show a readable message instead of the bare
+    # PyInstaller "Failed to execute script" dialog with an empty crash file.
+    try:
+        import cv2 as _cv2
+        import numpy as _np
+    except Exception as _imp_err:
+        import traceback
+        _append_crash("Top-level import failed:\n" + traceback.format_exc())
+        try:
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+            _r = _tk.Tk(); _r.withdraw()
+            _mb.showerror(
+                "FACEBLUR - missing components",
+                "Failed to load required components ({}).\n\n"
+                "This usually means the build did not bundle OpenCV/NumPy.\n"
+                "Details written to faceblur_crash.txt next to the app."
+                .format(type(_imp_err).__name__))
+            _r.destroy()
+        except Exception:
+            pass
+        sys.exit(1)
     globals()["cv2"] = _cv2
     globals()["np"]  = _np
 
@@ -1691,24 +1932,45 @@ if __name__ == "__main__":
 
     _loaded = {}
 
-    def _background_load():
-        # First run: torch not installed yet — install it now
-        if not _torch_is_installed():
-            splash.set_status("First run setup...", 0.1)
-            _loaded["gpu_info"] = _install_torch_first_run(splash)
-        else:
-            splash.set_status("Detecting GPU...", 0.5)
-            _loaded["gpu_info"] = detect_gpu()
+    def _fail(msg, exc=None):
+        # Marshal an error onto the splash from any thread and make it
+        # closeable. Always runs on the Tk thread via after().
+        if exc is not None:
+            import traceback
+            _append_crash("".join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__)))
+        try:
+            splash.after(0, lambda: splash.show_error(msg))
+        except Exception:
+            pass
 
-        splash.set_status("Ready.", 0.9)
-        splash.after(0, _launch_app)
+    def _background_load():
+        try:
+            # First run: torch not installed yet — install it now
+            if not _torch_is_installed():
+                splash.set_status("First run setup...", 0.1)
+                _loaded["gpu_info"] = _install_torch_first_run(splash)
+            else:
+                splash.set_status("Detecting GPU...", 0.5)
+                _loaded["gpu_info"] = detect_gpu()
+
+            splash.set_status("Ready.", 0.9)
+            splash.after(0, _launch_app)
+        except Exception as e:
+            # Crash during load: don't leave the splash floating forever.
+            _fail("Startup error - see faceblur_crash.txt", e)
 
     def _launch_app():
-        splash.set_status("Building interface...", 1.0)
-        splash.update()
-        app = App(gpu_info=_loaded.get("gpu_info"))
-        splash.destroy()
-        app.mainloop()
+        try:
+            splash.set_status("Building interface...", 1.0)
+            splash.update()
+            app = App(gpu_info=_loaded.get("gpu_info"))
+            splash.destroy()
+            app.mainloop()
+        except Exception as e:
+            # Show a closeable error window instead of re-raising (a re-raise
+            # here is swallowed by Tk and the splash would float forever).
+            _fail("Startup error - see faceblur_crash.txt", e)
 
     threading.Thread(target=_background_load, daemon=True).start()
     splash.mainloop()

@@ -131,8 +131,18 @@ Requires Inno Setup 6 or 7 installed (`https://jrsoftware.org/isdl.php`).
 ```bash
 conda create -n faceblur python=3.10 -y
 conda activate faceblur
-pip install ultralytics opencv-python numpy pyinstaller dill win10toast pillow
+pip install ultralytics opencv-contrib-python "numpy<2" pyinstaller dill win10toast pillow
 ```
+Notes:
+- Use **opencv-contrib-python** (not `opencv-python`) — the face tracker uses
+  `cv2.legacy.TrackerCSRT_create`, which only exists in the contrib build.
+  Don't install both; they conflict.
+- Pin **numpy<2**. opencv/torch binaries in this stack are built against numpy 1.x,
+  and a numpy 2.x in the same environment causes native crashes (and makes
+  PyInstaller silently drop `cv2`).
+- **torch is not installed here.** The app downloads the matching CPU/CUDA build
+  on first run; `build_installer.bat` installs CPU torch into the build env only
+  (for analysis) and excludes it from the exe.
 
 ---
 
@@ -141,9 +151,9 @@ pip install ultralytics opencv-python numpy pyinstaller dill win10toast pillow
 | Package | Purpose |
 |---|---|
 | `ultralytics` | YOLOv11 face detection |
-| `opencv-python` | Video I/O, frame processing, CSRT tracking |
-| `torch` | Neural network inference (CPU or CUDA) |
-| `numpy` | Array operations |
+| `opencv-contrib-python` | Video I/O, frame processing, CSRT tracking (contrib build required for `cv2.legacy` trackers) |
+| `torch` | Neural network inference (CPU or CUDA) — downloaded on first run, not bundled |
+| `numpy` | Array operations — **pin `numpy<2`** for binary compatibility with opencv/torch |
 | `pillow` | Thumbnail preview images |
 | `ffmpeg` | Audio merging, H.264 encoding |
 | `dill` | Multiprocessing serialization |

@@ -41,14 +41,27 @@ if errorlevel 1 ( echo [ERROR] Activate failed. & pause & exit /b 1 )
 echo       Activated: %CONDA_PREFIX%
 
 echo.
+:: Hold numpy<2 across all pip installs here (incl. install_torch.ps1).
+:: Relative path + cd: pip splits PIP_CONSTRAINT on spaces and the project
+:: path may contain spaces, so an absolute path would break.
+cd /d "%~dp0"
+>constraints.txt echo numpy^<2
+set PIP_CONSTRAINT=constraints.txt
+
 echo [3/4] Checking packages (install only if missing)...
-"%CONDA_PREFIX%\Scripts\python.exe" -c "import ultralytics, cv2, numpy, PIL, win10toast" >nul 2>&1
+"%CONDA_PREFIX%\python.exe" -c "import ultralytics, cv2, numpy, PIL, win10toast; cv2.legacy.TrackerCSRT_create" >nul 2>&1
 if errorlevel 1 (
     echo       Some packages missing, installing...
     if exist "%~dp0install_torch.ps1" (
         powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install_torch.ps1" "%CONDA_PREFIX%\Scripts\pip.exe"
     )
-    "%CONDA_PREFIX%\Scripts\pip.exe" install opencv-python numpy pyinstaller dill win10toast pillow
+    "%CONDA_PREFIX%\Scripts\pip.exe" uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless >nul 2>&1
+    "%CONDA_PREFIX%\Scripts\pip.exe" install ultralytics pyinstaller dill win10toast pillow
+    :: opencv-contrib LAST so its cv2 (incl. cv2.legacy) wins over ultralytics' opencv-python dep.
+    :: remove opencv-python (ultralytics dep) so only CONTRIB is registered;
+    :: two opencv distros make PyInstaller drop cv2 from the exe.
+    "%CONDA_PREFIX%\Scripts\pip.exe" uninstall -y opencv-python opencv-python-headless >nul 2>&1
+    "%CONDA_PREFIX%\Scripts\pip.exe" install --force-reinstall --no-deps opencv-contrib-python
 :: Note: torch is NOT pre-installed - it installs at first run based on user GPU
     if errorlevel 1 ( echo [ERROR] pip install failed. & pause & exit /b 1 )
 ) else (
@@ -84,6 +97,9 @@ if exist "%~dp0dist\FACEBLUR.exe" del /f /q "%~dp0dist\FACEBLUR.exe"
     --hidden-import ultralytics ^
     --hidden-import PIL ^
     --hidden-import win10toast ^
+    --hidden-import pickletools ^
+    --hidden-import html.parser ^
+    --collect-all cv2 ^
     --exclude-module torch ^
     --exclude-module torchvision ^
     --add-data "ffmpeg.exe;." ^
