@@ -1,4 +1,4 @@
-# FACEBLUR v1.0
+# FACEBLUR v1.0.1
 **Automated face censoring application**
 Made by werehappy
 
@@ -192,7 +192,8 @@ If the GPU version is installed but CUDA is unavailable at runtime, the app disp
 | Version | Date | Notes |
 |---|---|---|
 | v1.0 | 2026 | Initial release |
+| v1.0.1 | 2026 | Reduced the size of installer |
 
 ---
 
-*FACEBLUR v1.0 — made by werehappy*
+*FACEBLUR v1.0.1 — made by werehappy*
