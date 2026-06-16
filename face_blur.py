@@ -13,12 +13,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 # Version
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 # Settings persistence
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".faceblur_settings.json")
 
-SETTINGS_VERSION = "1.0.1"
+SETTINGS_VERSION = "1.1.0"
 
 def load_settings():
     try:
@@ -230,18 +230,98 @@ YOLO_MODELS = {
 }
 _detector_cache = {}
 
-def get_detector(model_key, log_fn=None):
-    filename, url = YOLO_MODELS[model_key]
+# ── Whole-head detection ──
+# Face models only fire on the facial region, so they miss backs/sides of heads.
+# To also cover the whole head we run a second detector and merge the results.
+#
+# DEFAULT METHOD = PERSON DETECTION -> HEAD REGION.
+# On hard footage (motion blur, helmets, partial/cut-off heads, e.g. CQB headcam)
+# dedicated head models fail, but the COCO "person" detector is very robust to
+# blur/occlusion/partial bodies. So by default we detect the person and censor
+# the head REGION (top-of-body, sized by shoulder width). This needs some torso
+# in frame, which is usually the case.
+#
+# The two methods are COMBINED (union), not either/or, because they cover
+# complementary failures:
+#   - person -> head region: robust to blur/helmets/side views/cut-off faces,
+#     but needs some torso in frame.
+#   - a real head model (head.pt, e.g. CrowdHuman-trained or fine-tuned on your
+#     footage): fires on the head itself, so it can catch a head with NO body
+#     visible -- the one case the person method cannot reach.
+# Whatever loads is used; if nothing loads, whole-head mode quietly behaves
+# like face-only.
+HEAD_MODEL_FILE = "head.pt"        # user-provided / fine-tuned head model (takes priority)
+
+# COCO person detector -> head region. Loaded via an EXPLICIT URL (the same robust
+# urllib path the face models use) instead of relying on ultralytics' internal
+# auto-downloader. The internal downloader frequently fails inside the frozen
+# PyInstaller exe (settings dir / SSL / offline first-run), which silently left
+# whole-head mode with no person model -> output was face-only. An explicit URL
+# matches how the face models already download successfully.
+HEAD_PERSON_MODEL = "yolo11n.pt"
+HEAD_PERSON_URL   = "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt"
+HEAD_PERSON_CLASS = 0              # COCO "person"
+
+# Whole-head COVERAGE geometry. These are the values validated on real footage
+# in the session-2 testing (test_detect.py uses the same 0.45/0.55). The padding
+# slider provides the extra margin on top, so keep these modest -- padding does
+# the work of covering ears/crown, and it is now applied correctly.
+HEAD_REGION_W_FRAC = 0.45   # person->head width  as a fraction of shoulder width
+HEAD_REGION_H_FRAC = 0.55   # person->head height as a fraction of shoulder width
+HEAD_REGION_TOP    = 0.0    # extend the region ABOVE the person-box top (frac of head height)
+# Face boxes are grown only SLIGHTLY toward head size in whole-head mode (faces
+# cover the lower-front of the head). Padding handles the rest; keep this mild so
+# coverage stays reasonable rather than ballooning when padding is also high.
+FACE_TO_HEAD_W     = 1.15   # grow a face box's WIDTH  by this (a little, for ears)
+FACE_TO_HEAD_H     = 1.25   # grow a face box's HEIGHT by this (a little, for crown/jaw)
+FACE_TO_HEAD_UP    = 0.10   # shift the grown box UP by this frac of its new height
+
+# Default head model, auto-downloaded when the user has NOT supplied their own
+# head.pt. A real head detector fires on the head itself, so it adds the one case
+# the person->region method cannot reach: a head with NO body in frame (peeking
+# side/back of head). Saved to a SEPARATE file so a user-supplied head.pt always
+# wins and is never overwritten.
+#   NOTE: public head models (SCUT-HEAD here) are trained on civilian, frontal,
+#   unoccluded heads. They help general footage but are weak on helmeted/blurred/
+#   tactical (CQB) footage -- for that, drop in a fine-tuned head.pt.
+#   Set HEAD_DEFAULT_URL = None to disable this auto-download entirely.
+HEAD_DEFAULT_FILE = "head_default.pt"
+HEAD_DEFAULT_URL  = "https://raw.githubusercontent.com/Abcfsa/YOLOv8_head_detector/main/nano.pt"
+
+# Heads (esp. backs/partials) score LOWER than faces, so run the head/person pass
+# at a lower confidence floor than the face pass (face conf minus this, min 0.15).
+HEAD_CONF_DROP = 0.15
+
+# Whole-head mode: a face box is treated as ALREADY covered (and dropped, to
+# avoid double-masking the same head) when at least this fraction of the RAW
+# face box falls inside some head/person box. Lower = more aggressive
+# suppression of redundant face censors; raise it toward 0.6 if you start
+# seeing real faces left uncovered next to a head box.
+FACE_COVERED_FRAC = 0.5
+
+def get_detector_by_file(filename, url=None, log_fn=None):
+    """Load (and cache) a YOLO model by file.
+    url=None -> let ultralytics auto-fetch known weights (e.g. yolo11n.pt).
+    url set   -> download to `filename` if missing."""
     if filename not in _detector_cache:
         from ultralytics import YOLO
-        if not os.path.exists(filename):
+        downloaded_now = False
+        if url and not os.path.exists(filename):
             if log_fn:
                 log_fn("  Downloading {} (first time only)...\n".format(filename), "warning")
             import urllib.request
             urllib.request.urlretrieve(url, filename)
+            downloaded_now = True
             if log_fn:
                 log_fn("  Download complete.\n", "success")
-        model = YOLO(filename)
+        try:
+            model = YOLO(filename)
+        except Exception:
+            # A corrupt/partial download must not poison future runs.
+            if downloaded_now:
+                try: os.remove(filename)
+                except Exception: pass
+            raise
         # Enable FP16 (half precision) on GPU for ~2x faster inference
         try:
             import torch
@@ -251,6 +331,74 @@ def get_detector(model_key, log_fn=None):
             pass
         _detector_cache[filename] = model
     return _detector_cache[filename]
+
+def get_detector(model_key, log_fn=None):
+    filename, url = YOLO_MODELS[model_key]
+    return get_detector_by_file(filename, url, log_fn)
+
+def get_head_detector(log_fn=None):
+    """Load the whole-head detectors. Returns (head_model, person_model).
+    BOTH are loaded and used together (union of their boxes):
+      head_model   -- head.pt next to the app (direct head boxes; catches heads
+                      with no body in frame). None if absent/broken.
+      person_model -- COCO person detector -> head region (robust to blur,
+                      helmets, partial bodies). None if it cannot load.
+    """
+    head_model = None
+    # 1) A head model the user dropped in (CrowdHuman-trained or fine-tuned on
+    #    your own footage) ALWAYS takes priority.
+    if os.path.exists(HEAD_MODEL_FILE):
+        try:
+            head_model = get_detector_by_file(HEAD_MODEL_FILE, None, log_fn)
+            if log_fn:
+                log_fn("  Head model: using your {}.\n".format(HEAD_MODEL_FILE), "success")
+        except Exception as e:
+            if log_fn:
+                log_fn("  [WARN] {} failed to load ({}).\n".format(HEAD_MODEL_FILE, e), "warning")
+    # 2) Otherwise auto-download a default head model (to a SEPARATE file, so a
+    #    user head.pt added later still wins and this is never overwritten).
+    if head_model is None and HEAD_DEFAULT_URL:
+        try:
+            head_model = get_detector_by_file(HEAD_DEFAULT_FILE, HEAD_DEFAULT_URL, log_fn)
+            if log_fn:
+                log_fn("  Head model: using default {} (fine-tune a head.pt for "
+                       "tactical/CQB footage).\n".format(HEAD_DEFAULT_FILE), "dim")
+        except Exception as e:
+            if log_fn:
+                log_fn("  [WARN] default head model unavailable ({}).\n".format(e), "warning")
+    # 3) Person detection -> head region (always attempted; complements the head
+    #    model and is robust to blur/helmets/partial bodies).
+    person_model = None
+    try:
+        person_model = get_detector_by_file(HEAD_PERSON_MODEL, HEAD_PERSON_URL, log_fn)
+    except Exception as e:
+        if log_fn:
+            log_fn("  [WARN] person model failed to load ({}).\n".format(e), "warning")
+    return head_model, person_model
+
+def _head_class_ids(detector):
+    """Figure out which class id(s) a head model uses for 'head'.
+    - If a class is literally named 'head', filter to it.
+    - If it's a single-class model, keep all (None).
+    - Otherwise keep all as a safe default.
+    Result is cached on the detector object itself."""
+    cached = getattr(detector, "_faceblur_head_classes", "unset")
+    if cached != "unset":
+        return cached
+    ids = None
+    try:
+        names = detector.names
+        items = names.items() if isinstance(names, dict) else enumerate(names)
+        head_ids = [int(i) for i, n in items if "head" in str(n).lower()]
+        if head_ids:
+            ids = head_ids
+    except Exception:
+        ids = None
+    try:
+        detector._faceblur_head_classes = ids
+    except Exception:
+        pass
+    return ids
 
 def clear_detector_cache():
     """Release YOLO models from memory and free CUDA cache."""
@@ -317,7 +465,8 @@ class FaceTracker:
         """Reset trackers from fresh YOLO detections."""
         self._trackers = []
         self._last_boxes = list(boxes)
-        for (x1, y1, x2, y2) in boxes:
+        for box in boxes:
+            x1, y1, x2, y2 = box[:4]   # boxes may carry a 5th score element
             try:
                 tr = cv2.legacy.TrackerCSRT_create()
                 tr.init(frame, (x1, y1, x2 - x1, y2 - y1))
@@ -339,9 +488,166 @@ class FaceTracker:
                 pass
         return result if result else self._last_boxes
 
-def _run_yolo(detector, frame, confidence):
-    """Run YOLO on a single frame and return list of (x1,y1,x2,y2,score)."""
-    results = detector(frame, conf=confidence, verbose=False, workers=0)
+# ── Temporal box smoothing (motion-aware anti-flicker) ──
+# Raw per-frame detections flicker: a blurred head is found on frame n, missed
+# on n+1, found on n+2. A plain EMA + fixed hold smooths static footage but
+# fails on DYNAMIC footage (headcam): held boxes stay at old SCREEN positions
+# while the camera pans, and the EMA lags behind fast motion. The smoother here:
+#   * CAMERA-MOTION COMPENSATION: global frame-to-frame shift is estimated by
+#     phase correlation on a downscaled grayscale; every track moves WITH the
+#     scene, so a held box stays glued to the spot in the world, not the screen.
+#   * VELOCITY: each track keeps its own (camera-compensated) velocity and
+#     coasts along it through missed detections.
+#   * SNAP, DON'T LAG: if a matched detection moved more than half a box-size,
+#     the track jumps straight to it; smoothing only damps sub-box jitter.
+#   * TENTATIVE vs CONFIRMED: a brand-new track is still censored IMMEDIATELY
+#     (privacy first) but dies after SMOOTH_HOLD_TENTATIVE missed frames unless
+#     it racks up SMOOTH_CONFIRM_HITS detections -- so a 1-frame false positive
+#     blinks for ~2 frames instead of being amplified into a 13-frame blob.
+SMOOTH_ALPHA          = 0.6   # EMA weight of the new detection (jitter damping)
+SMOOTH_SNAP_FRAC      = 0.5   # displacement > this fraction of box size -> snap
+SMOOTH_HOLD           = 8     # missed frames a CONFIRMED track survives
+SMOOTH_HOLD_TENTATIVE = 2     # missed frames a brand-new (1-hit) track survives
+SMOOTH_CONFIRM_HITS   = 3     # kept for compatibility; hold now ramps with hits
+SMOOTH_IOU            = 0.20  # IoU match gate...
+SMOOTH_DIST_FRAC      = 0.80  # ...or center distance under this x box size
+SMOOTH_MOTION_W       = 256   # downscale width for camera-motion estimation
+
+class BoxSmoother:
+    """Turns raw per-frame detections into stable, motion-following tracks.
+    Call update(boxes, frame) every frame; pass the (unblurred) frame so the
+    smoother can estimate camera motion. Returns (x1, y1, x2, y2, score)."""
+
+    def __init__(self, alpha=SMOOTH_ALPHA, hold=SMOOTH_HOLD,
+                 hold_tentative=SMOOTH_HOLD_TENTATIVE,
+                 confirm_hits=SMOOTH_CONFIRM_HITS, iou=SMOOTH_IOU):
+        self.alpha = float(alpha)
+        self.hold = int(hold)
+        self.hold_tentative = int(hold_tentative)
+        self.confirm_hits = int(confirm_hits)
+        self.iou_t = float(iou)
+        self.tracks = []        # dicts: x1 y1 x2 y2 vx vy score hits miss
+        self._prev_small = None
+        self._prev_scale = 1.0
+
+    # -- camera motion ----------------------------------------------------
+    def _camera_shift(self, frame):
+        """Global content shift (dx, dy) between the previous frame and this
+        one, in full-frame pixels. (0, 0) if it cannot be estimated."""
+        try:
+            g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            scale = SMOOTH_MOTION_W / float(g.shape[1])
+            small = cv2.resize(g, (SMOOTH_MOTION_W, max(2, int(g.shape[0] * scale))),
+                               interpolation=cv2.INTER_AREA).astype("float32")
+            prev = self._prev_small
+            self._prev_small = small
+            self._prev_scale = scale
+            if prev is None or prev.shape != small.shape:
+                return 0.0, 0.0
+            (dx, dy), resp = cv2.phaseCorrelate(prev, small)
+            if resp < 0.05:   # heavy blur / scene cut: shift unreliable
+                return 0.0, 0.0
+            return dx / scale, dy / scale
+        except Exception:
+            return 0.0, 0.0
+
+    # -- helpers ------------------------------------------------------------
+    @staticmethod
+    def _iou(t, b):
+        ix1, iy1 = max(t["x1"], b[0]), max(t["y1"], b[1])
+        ix2, iy2 = min(t["x2"], b[2]), min(t["y2"], b[3])
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        if inter <= 0.0:
+            return 0.0
+        a_t = (t["x2"] - t["x1"]) * (t["y2"] - t["y1"])
+        a_b = (b[2] - b[0]) * (b[3] - b[1])
+        union = a_t + a_b - inter
+        return inter / union if union > 0 else 0.0
+
+    @staticmethod
+    def _center(o):
+        if isinstance(o, dict):
+            return (o["x1"] + o["x2"]) / 2.0, (o["y1"] + o["y2"]) / 2.0
+        return (o[0] + o[2]) / 2.0, (o[1] + o[3]) / 2.0
+
+    def _shift_track(self, tr, dx, dy):
+        tr["x1"] += dx; tr["x2"] += dx
+        tr["y1"] += dy; tr["y2"] += dy
+
+    # -- main ---------------------------------------------------------------
+    def update(self, boxes, frame=None):
+        # 1) Move every track with the camera, then along its own velocity.
+        cam_dx = cam_dy = 0.0
+        if frame is not None:
+            cam_dx, cam_dy = self._camera_shift(frame)
+        for tr in self.tracks:
+            self._shift_track(tr, cam_dx + tr["vx"], cam_dy + tr["vy"])
+
+        dets = [tuple(map(float, b[:4])) + (float(b[4]) if len(b) > 4 else 1.0,)
+                for b in boxes]
+
+        # 2) Greedy matching: confirmed tracks pick first. A detection matches
+        #    a track if boxes overlap OR centers are within a box-size.
+        unmatched = list(dets)
+        for tr in sorted(self.tracks, key=lambda t: -t["hits"]):
+            size = max(tr["x2"] - tr["x1"], tr["y2"] - tr["y1"], 1.0)
+            tcx, tcy = self._center(tr)
+            best, best_cost = None, None
+            for b in unmatched:
+                bcx, bcy = self._center(b)
+                dist = ((bcx - tcx) ** 2 + (bcy - tcy) ** 2) ** 0.5
+                if self._iou(tr, b) >= self.iou_t or dist <= SMOOTH_DIST_FRAC * size:
+                    if best_cost is None or dist < best_cost:
+                        best, best_cost = b, dist
+            if best is None:
+                tr["miss"] += 1
+                tr["vx"] *= 0.9    # decay velocity while coasting blind
+                tr["vy"] *= 0.9
+                continue
+            unmatched.remove(best)
+            bcx, bcy = self._center(best)
+            # Velocity correction: (bcx - tcx) is the residual AFTER the
+            # prediction already moved the track by vx, so the correct update
+            # is v += k*residual (v = 0.5v + 0.5r would converge to half the
+            # true velocity). Clamped to one box-size per frame.
+            tr["vx"] = max(-size, min(size, tr["vx"] + 0.6 * (bcx - tcx)))
+            tr["vy"] = max(-size, min(size, tr["vy"] + 0.6 * (bcy - tcy)))
+            disp = best_cost
+            a = 1.0 if disp > SMOOTH_SNAP_FRAC * size else self.alpha
+            tr["x1"] = a * best[0] + (1 - a) * tr["x1"]
+            tr["y1"] = a * best[1] + (1 - a) * tr["y1"]
+            tr["x2"] = a * best[2] + (1 - a) * tr["x2"]
+            tr["y2"] = a * best[3] + (1 - a) * tr["y2"]
+            tr["score"] = max(tr["score"] * 0.9, best[4])
+            tr["hits"] += 1
+            tr["miss"] = 0
+
+        # 3) Cull with a GRADUATED hold: the more detections a track has
+        #    accumulated, the longer it may coast blind. A 1-frame false
+        #    positive lives only 1 + SMOOTH_HOLD_TENTATIVE frames, while a
+        #    head detected even every 3rd frame keeps ratcheting up evidence
+        #    (hits=1 -> hold 2, 2 -> 4, 3 -> 6, 4+ -> SMOOTH_HOLD) and is
+        #    never dropped between detections.
+        kept = []
+        for tr in self.tracks:
+            limit = min(self.hold, self.hold_tentative + 2 * (tr["hits"] - 1))
+            if tr["miss"] <= limit:
+                kept.append(tr)
+        self.tracks = kept
+
+        # 4) Spawn new tracks for unmatched detections (cover immediately).
+        for b in unmatched:
+            self.tracks.append({"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3],
+                                "vx": 0.0, "vy": 0.0,
+                                "score": b[4], "hits": 1, "miss": 0})
+
+        return [(int(t["x1"]), int(t["y1"]), int(t["x2"]), int(t["y2"]),
+                 t["score"]) for t in self.tracks]
+
+def _run_yolo(detector, frame, confidence, classes=None):
+    """Run YOLO on a single frame and return list of (x1,y1,x2,y2,score).
+    classes: optional list of class ids to keep (e.g. [0]=person for COCO)."""
+    results = detector(frame, conf=confidence, verbose=False, workers=0, classes=classes)
     boxes = []
     for result in results:
         if result.boxes is None:
@@ -374,10 +680,12 @@ def _dedup_boxes(boxes, iou_thresh=0.4):
             kept.append(b)
     return kept
 
-def detect_faces(frame, detector, confidence, detect_scale=0.5, edge_strip=True):
+def detect_faces(frame, detector, confidence, detect_scale=0.5, edge_strip=True, classes=None,
+                 edge_conf_drop=0.1):
     """
     Run YOLO on downscaled frame + edge strips for partial/out-of-frame faces.
     Returns list of (x1, y1, x2, y2, score).
+    classes: optional list of class ids to keep (e.g. [0]=person).
     """
     h, w = frame.shape[:2]
 
@@ -386,13 +694,13 @@ def detect_faces(frame, detector, confidence, detect_scale=0.5, edge_strip=True)
         sw = max(32, int(w * detect_scale))
         sh = max(32, int(h * detect_scale))
         small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_LINEAR)
-        raw = _run_yolo(detector, small, confidence)
+        raw = _run_yolo(detector, small, confidence, classes)
         # Scale coords back up
         boxes = [(int(x1/detect_scale), int(y1/detect_scale),
                   int(x2/detect_scale), int(y2/detect_scale), s)
                  for (x1, y1, x2, y2, s) in raw]
     else:
-        boxes = _run_yolo(detector, frame, confidence)
+        boxes = _run_yolo(detector, frame, confidence, classes)
 
     # Edge strip passes (20% of each side, full resolution)
     if edge_strip:
@@ -407,12 +715,166 @@ def detect_faces(frame, detector, confidence, detect_scale=0.5, edge_strip=True)
             strip = frame[sy1:sy2, sx1:sx2]
             if strip.size == 0:
                 continue
-            raw = _run_yolo(detector, strip, max(0.1, confidence - 0.1))
+            raw = _run_yolo(detector, strip, max(0.1, confidence - edge_conf_drop), classes)
             for (x1, y1, x2, y2, s) in raw:
                 # Translate back to full frame coords
                 boxes.append((x1+sx1, y1+sy1, x2+sx1, y2+sy1, s))
 
     return _dedup_boxes(boxes)
+
+def _person_to_head(boxes):
+    """Head region from a person box, sized by SHOULDER WIDTH (not body height,
+    which breaks when the body is cut off). Generous on purpose so it covers the
+    EARS and the back/crown of the head, not just the face. Top-centered on the
+    person box and extended slightly above its top for the crown/hair. This is
+    the YELLOW box in test_detect.py."""
+    out = []
+    for (x1, y1, x2, y2, s) in boxes:
+        bw = x2 - x1
+        if bw <= 0:
+            continue
+        cx = (x1 + x2) // 2
+        hw = max(1, int(bw * HEAD_REGION_W_FRAC) // 2)   # half-width of head
+        hh = max(1, int(bw * HEAD_REGION_H_FRAC))        # head height
+        top = int(y1 - HEAD_REGION_TOP * hh)             # reach above for the crown
+        out.append((cx - hw, top, cx + hw, top + hh, s))
+    return out
+
+def _face_to_head(boxes):
+    """Grow a FACE box outward into a whole-HEAD box: faces sit in the lower-
+    centre of the head, so the head extends sideways (ears) and upward (crown),
+    plus some margin behind. Used only when whole-head mode is on, so a head the
+    head/person passes missed but the FACE model caught still gets fully covered
+    instead of leaving ears/back showing."""
+    out = []
+    for b in boxes:
+        x1, y1, x2, y2 = b[:4]
+        s = b[4] if len(b) > 4 else 1.0
+        w = x2 - x1; h = y2 - y1
+        if w <= 0 or h <= 0:
+            continue
+        cx = (x1 + x2) / 2.0; cy = (y1 + y2) / 2.0
+        nw = w * FACE_TO_HEAD_W; nh = h * FACE_TO_HEAD_H
+        cy -= FACE_TO_HEAD_UP * nh                       # head centre is above the face centre
+        out.append((int(cx - nw / 2), int(cy - nh / 2),
+                    int(cx + nw / 2), int(cy + nh / 2), s))
+    return out
+
+def _contained(inner, outer, thresh=0.6):
+    """True if >= thresh of `inner`'s area falls inside `outer`."""
+    ix1, iy1, ix2, iy2 = inner[:4]
+    ox1, oy1, ox2, oy2 = outer[:4]
+    ax1, ay1 = max(ix1, ox1), max(iy1, oy1)
+    ax2, ay2 = min(ix2, ox2), min(iy2, oy2)
+    inter = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_inner = max(1, (ix2 - ix1) * (iy2 - iy1))
+    return inter / area_inner >= thresh
+
+def _merge_face_head(face_boxes, head_boxes):
+    """DEPRECATED / UNUSED. Kept for reference only.
+    detect_objects now suppresses covered RAW face boxes and grows only the
+    survivors inline, instead of growing every face first and merging here
+    (which let a grown face survive containment and produce a second censor on
+    a head already covered by a head/person box).
+
+    Union of both detectors.
+    Head boxes are bigger and cover the whole head, so they are kept as-is.
+    Face boxes are kept only where no head box already covers them, so the
+    face model acts as a safety net for heads the head model missed.
+    (A face box sits *inside* its head box, so IoU dedup alone won't merge
+    them -- we use containment instead.)"""
+    merged = list(head_boxes)
+    for fb in face_boxes:
+        if not any(_contained(fb, hb) for hb in head_boxes):
+            merged.append(fb)
+    return _dedup_boxes(merged)
+
+def detect_objects(frame, face_detector, head_model, person_model, confidence,
+                   detect_scale=0.5, edge_strip=True, detect_head=False):
+    """Detect faces, and optionally whole heads, then merge (union).
+
+    Whole-head mode runs UP TO TWO extra passes and unions everything:
+      person_model : person box -> estimated head region. Covers side faces,
+                     1/4-cut faces and blurred heads -- anyone with some torso
+                     visible.
+      head_model   : direct head boxes (head.pt). Covers heads with NO body in
+                     frame, the case the person method cannot reach. Runs at
+                     FULL resolution with edge strips, because such heads are
+                     small/partial and downscaling makes them invisible.
+    Returns list of (x1, y1, x2, y2, score).
+
+    Side effect: fills LAST_DETECT_BREAKDOWN with the raw per-source boxes
+    {'face': [...], 'person': [...], 'head': [...]} so the caller can show
+    color-coded debug boxes / per-pass counts (is each pass contributing?)."""
+    global LAST_DETECT_BREAKDOWN
+    face_boxes = detect_faces(frame, face_detector, confidence, detect_scale, edge_strip)
+    LAST_DETECT_BREAKDOWN = {"face": list(face_boxes), "person": [], "head": []}
+    if not detect_head:
+        return face_boxes
+    if head_model is None and person_model is None:
+        # Whole-head requested but no head/person model loaded: still grow the
+        # face boxes to head size so ears/crown get covered (best effort).
+        return _dedup_boxes(_face_to_head(face_boxes))
+    # Backs/sides of heads score lower than faces -> use a lower floor here.
+    head_conf = max(0.15, confidence - HEAD_CONF_DROP)
+    extra = []
+    if person_model is not None:
+        # Full resolution regardless of the Detect-scale slider: small/partial/
+        # side-on bodies vanish at 0.5x and the person pass then finds nothing,
+        # which is a common reason whole-head mode "did nothing". Person boxes are
+        # large, so full-res here is cheap relative to the recall it buys.
+        person_raw = detect_faces(frame, person_model, head_conf, 1.0,
+                                  edge_strip=False, classes=[HEAD_PERSON_CLASS])
+        person_heads = _person_to_head(person_raw)
+        LAST_DETECT_BREAKDOWN["person"] = list(person_heads)
+        extra.extend(person_heads)
+    if head_model is not None:
+        head_classes = _head_class_ids(head_model)
+        # head_conf is already lowered by HEAD_CONF_DROP; do NOT drop it
+        # again on the edge strips (full-res strips at ~0.10 conf were a
+        # false-positive factory).
+        model_heads = detect_faces(frame, head_model, head_conf, 1.0,
+                                   edge_strip, classes=head_classes,
+                                   edge_conf_drop=0.0)
+        LAST_DETECT_BREAKDOWN["head"] = list(model_heads)
+        extra.extend(model_heads)
+    # Drop face boxes that a head/person box already covers BEFORE growing them,
+    # so one head never gets a face censor AND a head censor stacked on top of
+    # each other (the double-masking bug). The test runs on the RAW face box: it
+    # is small and sits well inside the head region, so containment catches it.
+    # If we grew the face first (old behavior), the enlarged, upward-shifted box
+    # was no longer contained, the test failed, and both censors survived.
+    #
+    # Faces that survive are heads the head/person passes genuinely MISSED; only
+    # those are grown to head size, so the face model still acts as a safety net.
+    # Debug breakdown keeps the RAW face boxes; only the censored union grows them.
+    head_union = _dedup_boxes(extra)
+    uncovered_faces = [fb for fb in face_boxes
+                       if not any(_contained(fb, hb, FACE_COVERED_FRAC)
+                                  for hb in head_union)]
+    return _dedup_boxes(list(head_union) + _face_to_head(uncovered_faces))
+
+# Per-source boxes of the most recent detect_objects call (for debug overlay).
+LAST_DETECT_BREAKDOWN = {"face": [], "person": [], "head": []}
+
+# Debug overlay colors (BGR): which pass produced which box.
+SOURCE_COLORS = (("face",   (255, 255,   0), "FACE"),       # cyan
+                 ("person", (  0, 255, 255), "PERSON->HEAD"),# yellow
+                 ("head",   (  0,   0, 255), "HEAD MODEL"))  # red
+
+def draw_source_debug(frame, breakdown):
+    """Thin per-source outlines + legend, so debug mode shows WHICH detector
+    found each head (face model vs person->region vs head.pt)."""
+    y = 18
+    for key, color, label in SOURCE_COLORS:
+        boxes = breakdown.get(key, [])
+        for b in boxes:
+            x1, y1, x2, y2 = [int(v) for v in b[:4]]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
+        cv2.putText(frame, "{}: {}".format(label, len(boxes)), (6, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+        y += 16
+    return frame
 
 def apply_censor(frame, boxes, mode, padding, intensity, block_size, debug):
     """Apply censor with confidence-weighted blur intensity."""
@@ -506,10 +968,52 @@ def get_ffmpeg_path():
 
     return None
 
+# Single-pass encoder settings (video is encoded exactly ONCE here).
+PIPE_PRESET = "veryfast"   # libx264 preset; keeps encode from bottlenecking detection
+PIPE_CRF    = "23"         # quality (lower = better/larger); 23 is x264's default
+
+def open_ffmpeg_pipe(ffmpeg_path, original_path, output_path, W, H, fps,
+                     stderr_fp, log_fn=None):
+    """Start an ffmpeg process that encodes censored frames -- fed as raw BGR24
+    bytes on stdin -- directly to the final H.264 mp4, muxing the ORIGINAL audio
+    in the SAME pass.
+
+    This replaces the old "write XVID temp, then re-encode to H.264" design, which
+    encoded every frame TWICE (XVID, then H.264) with a decode in between -- double
+    the encode time, double the generation loss, plus a temp file. Here each frame
+    is encoded once and the audio is muxed inline, so there is no separate merge
+    step (and the encode time is naturally part of the processing ETA).
+
+    Returns the Popen (write frames to .stdin) or None if ffmpeg can't start.
+    `-map 1:a:0?` makes audio optional, so silent sources don't fail.
+    """
+    import subprocess
+    fps_str = "{:.6f}".format(fps if fps and fps > 0 else 30.0)
+    cmd = [
+        ffmpeg_path, "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", "{}x{}".format(W, H), "-r", fps_str, "-i", "-",  # input 0: frames
+        "-i", original_path,                                    # input 1: audio src
+        "-map", "0:v:0", "-map", "1:a:0?",
+        "-c:v", "libx264", "-preset", PIPE_PRESET, "-crf", PIPE_CRF,
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+        output_path,
+    ]
+    try:
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=stderr_fp)
+    except Exception as e:
+        if log_fn:
+            log_fn("  [WARN] could not start ffmpeg encoder ({}).\n".format(e), "warning")
+        return None
+
 def merge_audio(original_path, muted_path, output_path, ffmpeg_path, log_fn=None):
     """
-    Use ffmpeg to copy audio from original into the processed video.
-    Returns True on success, False on failure.
+    LEGACY two-pass merge (only used as a fallback when the single-pass pipe in
+    open_ffmpeg_pipe can't start). Copies audio from the original into an already
+    re-encoded video. Returns True on success, False on failure.
     """
     import subprocess
     if log_fn:
@@ -572,26 +1076,35 @@ FV = ("Courier New", 11, "bold")
 class App(tk.Tk):
     def __init__(self, gpu_info=None):
         super().__init__()
-        self.title("FACEBLUR v1.0.1")
+        self.title("FACEBLUR v1.1")
         self.configure(bg=BG)
         self.geometry("960x780")
         self.minsize(900, 700)
         self._files        = []
         self._cancel_flag  = threading.Event()
-        self._outdir       = tk.StringVar()
-        self._mode         = tk.StringVar(value="Blur")
-        self._model_key    = tk.StringVar(value=list(YOLO_MODELS.keys())[0])
-        self._conf         = tk.DoubleVar(value=0.40)
-        self._pad          = tk.DoubleVar(value=0.25)
-        self._blur_k       = tk.IntVar(value=51)
-        self._pixel_sz     = tk.IntVar(value=15)
-        self._debug        = tk.BooleanVar(value=False)
-        self._skip_frames  = tk.IntVar(value=2)
-        self._detect_scale = tk.DoubleVar(value=0.50)
+        # IMPORTANT: bind every Variable to THIS root (master=self). The splash
+        # is a separate Tk() and is still alive when App is constructed, so a
+        # Variable created without a master would attach to the splash's
+        # interpreter. The widgets live in THIS interpreter, so after the splash
+        # is destroyed, .get()/.set() and the widgets would read/write DIFFERENT
+        # Tcl variables -- every live UI change (e.g. frame skip, smooth boxes)
+        # would be silently ignored and processing would run with stale values.
+        self._outdir       = tk.StringVar(self)
+        self._mode         = tk.StringVar(self, value="Blur")
+        self._model_key    = tk.StringVar(self, value=list(YOLO_MODELS.keys())[0])
+        self._conf         = tk.DoubleVar(self, value=0.40)
+        self._pad          = tk.DoubleVar(self, value=0.25)
+        self._blur_k       = tk.IntVar(self, value=51)
+        self._pixel_sz     = tk.IntVar(self, value=15)
+        self._debug        = tk.BooleanVar(self, value=False)
+        self._skip_frames  = tk.IntVar(self, value=2)
+        self._detect_scale = tk.DoubleVar(self, value=0.50)
         self._gpu_info     = gpu_info if gpu_info is not None else detect_gpu()
-        self._suffix       = tk.StringVar(value="_blurred")
-        self._edge_strip   = tk.BooleanVar(value=True)
-        self._export_report = tk.BooleanVar(value=False)
+        self._suffix       = tk.StringVar(self, value="_blurred")
+        self._edge_strip   = tk.BooleanVar(self, value=True)
+        self._detect_head  = tk.BooleanVar(self, value=False)
+        self._smooth_boxes = tk.BooleanVar(self, value=True)
+        self._export_report = tk.BooleanVar(self, value=False)
         self._file_status  = {}
         self._build()
 
@@ -603,7 +1116,7 @@ class App(tk.Tk):
         top.pack(fill="x", padx=20, pady=(16, 0))
         tk.Label(top, text="FACEBLUR", bg=BG, fg=ACCENT, font=FH).pack(side="left")
         tk.Label(top, text="YOLOv8 face censoring", bg=BG, fg=TDIM, font=FS).pack(side="left", padx=12)
-        tk.Label(top, text="v1.0.1", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left")
+        tk.Label(top, text="v1.1", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left")
         tk.Label(top, text="made by werehappy", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left", padx=4)
         # GPU/CPU indicator (right side of top bar)
         if self._gpu_info["torch_cuda"]:
@@ -778,6 +1291,16 @@ class App(tk.Tk):
                        bg=BG, fg=TMID, font=FS, selectcolor=BG3,
                        activebackground=BG, activeforeground=ACCENT
                        ).pack(side="left")
+        tk.Checkbutton(opts_row2, text="Detect whole head (incl. back)",
+                       variable=self._detect_head,
+                       bg=BG, fg=TMID, font=FS, selectcolor=BG3,
+                       activebackground=BG, activeforeground=ACCENT
+                       ).pack(side="left", padx=(12, 0))
+        tk.Checkbutton(opts_row2, text="Smooth boxes (anti-flicker)",
+                       variable=self._smooth_boxes,
+                       bg=BG, fg=TMID, font=FS, selectcolor=BG3,
+                       activebackground=BG, activeforeground=ACCENT
+                       ).pack(side="left", padx=(12, 0))
 
         suffix_row = tk.Frame(self._opts_body, bg=BG)
         suffix_row.pack(fill="x", padx=8, pady=(0, 8))
@@ -974,6 +1497,8 @@ class App(tk.Tk):
         self._detect_scale.set(0.50)
         self._debug.set(False)
         self._edge_strip.set(True)
+        self._detect_head.set(False)
+        self._smooth_boxes.set(True)
         self._export_report.set(False)
         self._mode.set("Blur")
         self._model_key.set(list(YOLO_MODELS.keys())[0])
@@ -1122,6 +1647,8 @@ class App(tk.Tk):
             "detect_scale": self._detect_scale.get(), "outdir": self._outdir.get(),
             "suffix": self._suffix.get(), "edge_strip": self._edge_strip.get(),
             "export_report": self._export_report.get(), "geometry": self.geometry(),
+            "detect_head": self._detect_head.get(),
+            "smooth_boxes": self._smooth_boxes.get(),
         }
         save_settings(data)
 
@@ -1132,11 +1659,13 @@ class App(tk.Tk):
         try:
             keys = ["mode", "model_key", "confidence", "padding", "blur_k",
                     "pixel_sz", "debug", "skip_frames", "detect_scale",
-                    "outdir", "suffix", "edge_strip", "export_report"]
+                    "outdir", "suffix", "edge_strip", "export_report",
+                    "detect_head", "smooth_boxes"]
             targets = [self._mode, self._model_key, self._conf, self._pad,
                        self._blur_k, self._pixel_sz, self._debug,
                        self._skip_frames, self._detect_scale, self._outdir,
-                       self._suffix, self._edge_strip, self._export_report]
+                       self._suffix, self._edge_strip, self._export_report,
+                       self._detect_head, self._smooth_boxes]
             for k, t in zip(keys, targets):
                 if k in data:
                     t.set(data[k])
@@ -1352,12 +1881,20 @@ class App(tk.Tk):
         def _do():
             try:
                 detector = get_detector(cfg["model_key"], log_fn=None)
+                head_model = None
+                person_model = None
+                if cfg.get("detect_head"):
+                    try:
+                        head_model, person_model = get_head_detector(log_fn=None)
+                    except Exception:
+                        head_model = person_model = None
                 cap = cv2.VideoCapture(path)
                 ok, frame = cap.read()
                 cap.release()
                 if not ok: return
-                boxes = detect_faces(frame, detector, cfg["confidence"],
-                                     cfg["detect_scale"], cfg["edge_strip"])
+                boxes = detect_objects(frame, detector, head_model, person_model,
+                                       cfg["confidence"], cfg["detect_scale"],
+                                       cfg["edge_strip"], cfg.get("detect_head", False))
                 preview = apply_censor(frame.copy(), boxes,
                                        cfg["mode"], cfg["padding"],
                                        cfg["intensity"], cfg["block_size"],
@@ -1374,8 +1911,29 @@ class App(tk.Tk):
                     self._thumb_lbl.config(image=photo, text="")
                     self._thumb_lbl._photo = photo
                 self.after(0, _show)
-                self._write_log("  Preview: {} face(s) on first frame\n".format(
+                self._write_log("  Preview: {} box(es) on first frame\n".format(
                     len(boxes)), "dim")
+                # Diagnostic: what does each whole-head pass find on its own?
+                if cfg.get("detect_head"):
+                    try:
+                        hc = max(0.15, cfg["confidence"] - HEAD_CONF_DROP)
+                        if person_model is not None:
+                            hr = detect_faces(frame, person_model, hc,
+                                              1.0, edge_strip=False,
+                                              classes=[HEAD_PERSON_CLASS])
+                            hb = _person_to_head(hr)
+                            self._write_log("  Person -> head regions: {} "
+                                            "on first frame\n".format(len(hb)),
+                                            "dim" if hb else "warning")
+                        if head_model is not None:
+                            hb2 = detect_faces(frame, head_model, hc, 1.0,
+                                               cfg["edge_strip"],
+                                               classes=_head_class_ids(head_model))
+                            self._write_log("  Head model alone: {} head(s) "
+                                            "on first frame\n".format(len(hb2)),
+                                            "dim" if hb2 else "warning")
+                    except Exception:
+                        pass
             except Exception:
                 pass
         threading.Thread(target=_do, daemon=True).start()
@@ -1404,6 +1962,8 @@ class App(tk.Tk):
             "detect_scale":  float(self._detect_scale.get()),
             "suffix":        MODE_SUFFIX.get(self._mode.get(), "_blurred"),
             "edge_strip":    self._edge_strip.get(),
+            "detect_head":   self._detect_head.get(),
+            "smooth_boxes":  self._smooth_boxes.get(),
             "export_report": self._export_report.get(),
         }
         if self._files:
@@ -1437,6 +1997,51 @@ class App(tk.Tk):
             return
         self._write_log("Model OK. Processing {} file(s)...\n".format(n_files), "accent")
 
+        head_model = None
+        person_model = None
+        if cfg.get("detect_head"):
+            self._write_log("Whole-head detection ON. Loading head detectors...\n", "accent")
+            try:
+                head_model, person_model = get_head_detector(log_fn=self._write_log)
+                methods = []
+                if person_model is not None:
+                    methods.append("person -> head region")
+                if head_model is not None:
+                    methods.append("dedicated head model (head.pt)")
+                if methods:
+                    self._write_log("Head detection OK ({}).\n".format(
+                        " + ".join(methods)), "accent")
+                    if head_model is None:
+                        self._write_log("  No head.pt found: back-of-head coverage "
+                                        "relies on person detection (needs some "
+                                        "torso in frame).\n  Run test_models.py to "
+                                        "pick a head.pt for this footage.\n", "warning")
+                    if head_model is not None:
+                        try:
+                            self._write_log("  Head classes: {}\n".format(
+                                head_model.names), "dim")
+                        except Exception:
+                            pass
+                else:
+                    self._write_log("[ERROR] Whole-head is ON but NO head/person "
+                                    "model loaded -> this run will be FACE-ONLY.\n"
+                                    "        The models download on first run; check "
+                                    "internet access and the warnings above.\n", "error")
+                    try:
+                        self.after(0, lambda: messagebox.showwarning(
+                            "Whole-head detection unavailable",
+                            "Could not load the head/person detector, so this run "
+                            "will censor faces only.\n\nThis usually means the "
+                            "first-run model download was blocked. Check your "
+                            "internet connection (or drop a head.pt next to the app) "
+                            "and try again."))
+                    except Exception:
+                        pass
+            except Exception as e:
+                self._write_log("[WARN] Head model failed ({}). "
+                                "Continuing face-only.\n".format(e), "warning")
+                head_model = person_model = None
+
         report_data = []
         for fi, path in enumerate(files, 1):
             if self._cancel_flag.is_set():
@@ -1466,36 +2071,77 @@ class App(tk.Tk):
                 self._write_log("  [ERROR] Bad dimensions\n", "error")
                 cap.release(); continue
 
-            tmp_path = outpath + ".tmp_raw.avi"
-            fourcc   = cv2.VideoWriter_fourcc(*"XVID")
-            writer   = cv2.VideoWriter(tmp_path, fourcc, fps, (W, H))
-            if not writer.isOpened():
-                tmp_path = outpath + ".tmp_raw.mp4"
-                fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
-                writer   = cv2.VideoWriter(tmp_path, fourcc, fps, (W, H))
-            if not writer.isOpened():
-                self._write_log("  [ERROR] Cannot create output\n", "error")
-                cap.release(); continue
-            self._write_log("  Codec: {}\n".format(
-                "XVID" if tmp_path.endswith(".avi") else "mp4v"), "dim")
+            # --- Output: single-pass H.264 encode + inline audio mux. No temp
+            #     file, no double encode. Falls back to the legacy cv2 writer +
+            #     second-pass merge ONLY if ffmpeg can't start the pipe. ---
+            ffmpeg_path = get_ffmpeg_path()
+            using_pipe  = False
+            proc        = None
+            writer      = None
+            tmp_path    = None
+            stderr_log  = outpath + ".ffmpeg.log"
+            stderr_fp   = None
+            if ffmpeg_path:
+                try:
+                    stderr_fp = open(stderr_log, "wb")
+                    proc = open_ffmpeg_pipe(ffmpeg_path, path, outpath, W, H, fps,
+                                            stderr_fp, log_fn=self._write_log)
+                except Exception:
+                    proc = None
+                if proc is not None:
+                    using_pipe = True
+                    self._write_log("  Encoder: H.264 single-pass (audio muxed inline)\n", "dim")
+                else:
+                    if stderr_fp is not None:
+                        try: stderr_fp.close()
+                        except Exception: pass
+                        stderr_fp = None
+            if not using_pipe:
+                # Legacy fallback: temp video now, audio merged in a 2nd pass.
+                tmp_path = outpath + ".tmp_raw.avi"
+                writer   = cv2.VideoWriter(tmp_path, cv2.VideoWriter_fourcc(*"XVID"), fps, (W, H))
+                if not writer.isOpened():
+                    tmp_path = outpath + ".tmp_raw.mp4"
+                    writer   = cv2.VideoWriter(tmp_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+                if not writer.isOpened():
+                    self._write_log("  [ERROR] Cannot create output\n", "error")
+                    cap.release(); continue
+                self._write_log("  Encoder: {} temp + ffmpeg merge (ffmpeg pipe "
+                                "unavailable)\n".format(
+                                    "XVID" if tmp_path.endswith(".avi") else "mp4v"),
+                                "warning")
 
             frame_n     = 0
             faces_n     = 0
             skip        = max(1, cfg["skip_frames"])
             dscale      = cfg["detect_scale"]
             t_start     = time.time()
-            tracker     = FaceTracker()
-            use_tracker = True
+            # The CSRT tracker only does anything BETWEEN detections, i.e. when
+            # frame-skipping. At skip=1 every frame is detected, so the tracker's
+            # interpolation is never used -- don't pay for it, and don't risk it
+            # holding a stale box. (This is separate from the Smooth-boxes option.)
+            use_tracker = skip > 1
+            tracker     = FaceTracker() if use_tracker else None
             boxes       = []
+            smoother    = BoxSmoother() if cfg.get("smooth_boxes", True) else None
+            src_totals  = {"face": 0, "person": 0, "head": 0}
+            logged_first_breakdown = False
+            # Make the active temporal processing visible, so "is smoothing on?"
+            # is never a guess. With both OFF, boxes are raw per-frame detections.
+            self._write_log("  Temporal: smoothing {} | between-frame tracking {}\n".format(
+                "ON" if smoother is not None else "OFF",
+                "ON (skip={})".format(skip) if use_tracker else "OFF (every frame)"),
+                "dim")
 
             while not self._cancel_flag.is_set():
                 ok, frame = cap.read()
                 if not ok: break
 
                 if frame_n % skip == 0:
-                    boxes = detect_faces(frame, detector,
-                                         cfg["confidence"], dscale,
-                                         cfg["edge_strip"])
+                    boxes = detect_objects(frame, detector, head_model, person_model,
+                                           cfg["confidence"], dscale,
+                                           cfg["edge_strip"],
+                                           cfg.get("detect_head", False))
                     if use_tracker:
                         try: tracker.update_from_detection(frame, boxes)
                         except Exception: use_tracker = False
@@ -1508,11 +2154,42 @@ class App(tk.Tk):
                     else:
                         current_boxes = boxes
 
+                # Per-source bookkeeping (which pass is actually finding heads?)
+                if frame_n % skip == 0:
+                    for k in src_totals:
+                        src_totals[k] += len(LAST_DETECT_BREAKDOWN.get(k, []))
+                    if not logged_first_breakdown:
+                        logged_first_breakdown = True
+                        if cfg.get("detect_head"):
+                            self._write_log(
+                                "  Frame 0 by source: face={} person->head={} "
+                                "head.pt={}\n".format(
+                                    len(LAST_DETECT_BREAKDOWN.get("face", [])),
+                                    len(LAST_DETECT_BREAKDOWN.get("person", [])),
+                                    len(LAST_DETECT_BREAKDOWN.get("head", []))), "dim")
+
+                # Temporal smoothing: stabilize boxes + hold through missed
+                # detections so the censor doesn't flicker.
+                if smoother is not None:
+                    current_boxes = smoother.update(current_boxes, frame)
+
                 frame = apply_censor(frame, current_boxes,
                                      cfg["mode"], cfg["padding"],
                                      cfg["intensity"], cfg["block_size"],
                                      cfg["debug"])
-                writer.write(frame)
+                if cfg["debug"] and cfg.get("detect_head") and frame_n % skip == 0:
+                    frame = draw_source_debug(frame, LAST_DETECT_BREAKDOWN)
+                if using_pipe:
+                    if frame.shape[1] != W or frame.shape[0] != H:
+                        frame = cv2.resize(frame, (W, H))
+                    try:
+                        proc.stdin.write(frame.tobytes())
+                    except (BrokenPipeError, OSError):
+                        self._write_log("  [ERROR] encoder closed early "
+                                        "(see encode error below).\n", "error")
+                        break
+                else:
+                    writer.write(frame)
                 frame_n += 1
                 faces_n += len(current_boxes)
 
@@ -1539,7 +2216,51 @@ class App(tk.Tk):
                         frame_n=frame_n, face_n=faces_n,
                         fps="{:.1f}".format(fps_proc), eta=eta_str)
 
-            cap.release(); writer.release()
+            cap.release()
+
+            # Finalize the encoder. For the single-pass pipe, closing stdin makes
+            # ffmpeg flush and write the moov atom (usually well under a second);
+            # the audio is already muxed. Show a real "Finalizing" state with the
+            # ETA cleared so it never freezes on a stale number.
+            if not self._cancel_flag.is_set():
+                self._set_progress(
+                    min(0.99, (frame_n / total) if total > 0 else 0.99),
+                    status="Finalizing {} (encoding/audio)...".format(fname),
+                    file_n="{}/{}".format(fi, n_files),
+                    frame_n=frame_n, face_n=faces_n, eta="0s")
+
+            enc_err   = ""
+            ok_output = False
+            if using_pipe:
+                try:
+                    if proc.stdin: proc.stdin.close()
+                except Exception: pass
+                rc = proc.wait()
+                if stderr_fp is not None:
+                    try: stderr_fp.close()
+                    except Exception: pass
+                try:
+                    with open(stderr_log, "r", errors="replace") as _f:
+                        enc_err = _f.read().strip()
+                except Exception:
+                    enc_err = ""
+                try: os.remove(stderr_log)
+                except Exception: pass
+                ok_output = (rc == 0 and os.path.exists(outpath)
+                             and os.path.getsize(outpath) > 0)
+            else:
+                if writer is not None:
+                    writer.release()
+
+            if cfg.get("detect_head"):
+                self._write_log("  Detections by source: face={} "
+                                "person->head={} head.pt={}\n".format(
+                                    src_totals["face"], src_totals["person"],
+                                    src_totals["head"]), "dim")
+                if src_totals["person"] == 0 and src_totals["head"] == 0:
+                    self._write_log("  [WARN] Whole-head passes found NOTHING in "
+                                    "this file.\n         Check: confidence too high? "
+                                    "person model loaded? head.pt present?\n", "warning")
             del tracker; frame = None; current_boxes = None
             try:
                 import torch
@@ -1552,25 +2273,37 @@ class App(tk.Tk):
             elif frame_n == 0:
                 self._write_log("  [ERROR] 0 frames read!\n", "error")
                 self._update_queue_status(path, "failed")
-                if os.path.exists(tmp_path): os.remove(tmp_path)
-            elif not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
-                self._write_log("  [ERROR] Output empty\n", "error")
+                for p in (outpath if using_pipe else tmp_path,):
+                    if p and os.path.exists(p):
+                        try: os.remove(p)
+                        except Exception: pass
             else:
-                ffmpeg = get_ffmpeg_path()
-                if ffmpeg:
-                    merged = merge_audio(path, tmp_path, outpath, ffmpeg,
-                                         log_fn=self._write_log)
-                    if os.path.exists(tmp_path): os.remove(tmp_path)
-                    if not merged:
-                        self._write_log("  Falling back to muted output.\n", "warning")
-                        if os.path.exists(tmp_path):
-                            os.rename(tmp_path, outpath)
+                if using_pipe:
+                    if not ok_output:
+                        self._write_log("  [ERROR] encode failed: {}\n".format(
+                            (enc_err[-200:] or "unknown error")), "error")
                 else:
-                    self._write_log("  [WARN] ffmpeg not found - no audio.\n", "warning")
-                    if os.path.exists(outpath): os.remove(outpath)
-                    os.rename(tmp_path, outpath)
+                    # Legacy two-pass fallback (only when the ffmpeg pipe couldn't start)
+                    if not tmp_path or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                        self._write_log("  [ERROR] Output empty\n", "error")
+                    else:
+                        ffmpeg = get_ffmpeg_path()
+                        if ffmpeg:
+                            merged = merge_audio(path, tmp_path, outpath, ffmpeg,
+                                                 log_fn=self._write_log)
+                            if merged and os.path.exists(tmp_path):
+                                os.remove(tmp_path)
+                            elif not merged:
+                                self._write_log("  Falling back to muted output.\n", "warning")
+                                if os.path.exists(tmp_path):
+                                    if os.path.exists(outpath): os.remove(outpath)
+                                    os.rename(tmp_path, outpath)
+                        else:
+                            self._write_log("  [WARN] ffmpeg not found - no audio.\n", "warning")
+                            if os.path.exists(outpath): os.remove(outpath)
+                            os.rename(tmp_path, outpath)
 
-                if os.path.exists(outpath):
+                if os.path.exists(outpath) and os.path.getsize(outpath) > 0:
                     mb        = os.path.getsize(outpath) / 1048576
                     t_elapsed = time.time() - t_file_start
                     self._write_log(
@@ -1578,7 +2311,7 @@ class App(tk.Tk):
                             frame_n, faces_n, mb, t_elapsed), "success")
                     self._set_progress(1.0, status="Done: {}".format(fname),
                                        file_n="{}/{}".format(fi, n_files),
-                                       frame_n=frame_n, face_n=faces_n)
+                                       frame_n=frame_n, face_n=faces_n, eta="0s")
                     self._update_queue_status(path, "done")
                     report_data.append({
                         "file": fname, "output": outpath,
@@ -1603,7 +2336,8 @@ class App(tk.Tk):
                 self._write_log("Report saved: {}\n".format(rpath), "dim")
         self._set_progress(
             0 if self._cancel_flag.is_set() else 1.0,
-            status="Cancelled." if self._cancel_flag.is_set() else "All done!")
+            status="Cancelled." if self._cancel_flag.is_set() else "All done!",
+            eta="-" if self._cancel_flag.is_set() else "0s")
 
 
 # ══════════════════════════════════════════════════════════
@@ -1625,7 +2359,7 @@ class SplashScreen(tk.Tk):
         inner.pack(fill="both", expand=True)
         tk.Label(inner, text="FACEBLUR", bg="#0f0f0f", fg="#00e5ff",
                  font=("Courier New", 32, "bold")).pack(pady=(30, 4))
-        tk.Label(inner, text="YOLOv8 face censoring  v1.0.1  |  made by werehappy",
+        tk.Label(inner, text="YOLOv8 face censoring  v1.1  |  made by werehappy",
                  bg="#0f0f0f", fg="#444444",
                  font=("Courier New", 9)).pack()
         self._status = tk.Label(inner, text="Starting...",
@@ -1965,6 +2699,13 @@ if __name__ == "__main__":
             splash.set_status("Building interface...", 1.0)
             splash.update()
             app = App(gpu_info=_loaded.get("gpu_info"))
+            # The splash was Tk's default root. Hand that role to the app before
+            # destroying the splash, so any parent-less dialogs (messageboxes)
+            # target the live app rather than the destroyed splash interpreter.
+            try:
+                tk._default_root = app
+            except Exception:
+                pass
             splash.destroy()
             app.mainloop()
         except Exception as e:

@@ -1,4 +1,4 @@
-# FACEBLUR v1.0.1
+# FACEBLUR v1.1
 **Automated face censoring application**
 Made by werehappy
 
@@ -6,7 +6,7 @@ Made by werehappy
 
 ## Overview
 
-FACEBLUR is a desktop application that automatically detects and censors faces in video files using YOLOv11 face detection. It supports multiple censor styles, GPU acceleration, batch processing, and audio preservation.
+FACEBLUR is a desktop application that automatically detects and censors faces in video files using YOLOv11 face detection. It supports optional whole-head detection (catches the back and sides of the head, not just the face), multiple censor styles, GPU acceleration, batch processing, and audio preservation.
 
 ---
 
@@ -14,8 +14,12 @@ FACEBLUR is a desktop application that automatically detects and censors faces i
 
 ### Detection
 - **YOLOv11 face detection** — nano / medium / large model options
+- **Whole-head detection** — optional pass that also censors heads the face model misses (backs/sides, partial heads). By default it uses **person detection** and censors the head *region* of each detected person, which is far more robust on hard footage (motion blur, helmets, partial bodies) than a head model. If you drop a dedicated head model in as `head.pt`, it is used *in addition* to the person method. All results are merged with the face boxes (union), so it only adds coverage. Toggle via the **Detect whole head** checkbox in OPTIONS. See *Whole-Head Detection Setup* below.
+- **No double-masking** — when whole-head mode is on, a face that's already covered by a head/person box is not censored a second time. The face box is only kept (and grown to head size) for heads the head/person passes genuinely missed, so each head gets exactly one censor region instead of an overlapping pair.
 - **Edge strip detection** — additional YOLO pass on frame borders to catch partially out-of-frame faces
 - **Face tracking (CSRT)** — smooth box interpolation between detection frames, eliminates flickering
+- **Motion-aware box smoothing** — detections become tracks that follow **camera motion** (global frame-to-frame shift estimated by phase correlation, ~4 ms/frame) and their own velocity, so held boxes stay glued to the head during fast pans instead of drifting onto walls. Position jitter is damped, but large real movement snaps instantly (no lag). Hold time is **graduated by evidence**: a 1-frame false positive disappears after ~3 frames, while a repeatedly-detected head earns up to 8 frames of blind coverage — detections every 2nd–3rd frame produce continuous, flicker-free cover. Toggle via **Smooth boxes (anti-flicker)** in OPTIONS (default ON)
+- **Per-source debug** — with **Show debug boxes** + whole-head mode on, thin outlines show which detector found each head: cyan = face model, yellow = person→head region, red = `head.pt`; the log prints per-source counts per file
 - **Confidence heatmap** — blur intensity scales with detection confidence
 - **Downscale detection** — runs detection on reduced resolution for speed, scales boxes back up
 - **Frame skipping** — runs YOLO every N frames, uses tracker between detections
@@ -74,7 +78,9 @@ FACEBLUR is a desktop application that automatically detects and censors faces i
 | Frame skip | 2 | 2x faster, barely noticeable |
 | Detect scale | 0.50 | 2x faster detection, minimal accuracy loss |
 | Edge strip | ON | Catches partial/out-of-frame faces |
+| Detect whole head | OFF | Turn ON to also censor backs/sides of heads (slower) |
 | Debug boxes | OFF | Clean output for production |
+| Smooth boxes | ON | Anti-flicker: smooths box motion and holds boxes through missed detections |
 
 ---
 
@@ -150,7 +156,7 @@ Notes:
 
 | Package | Purpose |
 |---|---|
-| `ultralytics` | YOLOv11 face detection |
+| `ultralytics` | YOLOv11 face detection; COCO `yolo11n` person detector for whole-head mode (or a dedicated `head.pt` if provided) |
 | `opencv-contrib-python` | Video I/O, frame processing, CSRT tracking (contrib build required for `cv2.legacy` trackers) |
 | `torch` | Neural network inference (CPU or CUDA) — downloaded on first run, not bundled |
 | `numpy` | Array operations — **pin `numpy<2`** for binary compatibility with opencv/torch |
@@ -177,6 +183,61 @@ If the GPU version is installed but CUDA is unavailable at runtime, the app disp
 
 ---
 
+## Whole-Head Detection Setup
+
+The **Detect whole head** option (OPTIONS section) runs a second, dedicated
+head-detection model alongside the face model and merges the results. Unlike a
+face model, a head model fires on the head itself — so it catches the back and
+sides of a head, and works even when only the head/shoulders are in frame.
+
+**How whole-head detection works (both methods together, union):**
+
+1. **Person detection → head region (always on).** The COCO person detector
+   (`yolo11n`, auto-downloaded) finds each person and censors the head region
+   (top-center, sized by shoulder width). Robust to motion blur, helmets,
+   fully-side faces and cut-off faces — anyone with some torso in frame.
+2. **A dedicated `head.pt` next to the app (used in addition, if present).**
+   A real head model fires on the head itself, so it catches heads with **no
+   body visible** — the one case the person method can't reach. This pass runs
+   at full resolution with edge strips, regardless of the Detect scale slider.
+   Put a **CrowdHuman-trained** model here (see `test_models.py` to pick one for
+   your footage), or later a model **fine-tuned on your own clips**.
+
+The results of both passes are merged with the face boxes (union), so adding a
+`head.pt` can only **add** coverage. A face box that already falls inside a
+head/person box is dropped rather than censored twice, so heads get a single
+clean censor region. If neither head/person model loads, whole-head mode behaves
+like normal face-only detection.
+
+**Tuning for hard footage (dynamic camera, motion blur, cut-off heads).** Such
+footage (e.g. CQB/body-cam) benefits from:
+
+| Setting | Value | Why |
+|---|---|---|
+| Frame skip | 1 | Detect every frame; tracking is unreliable under fast camera motion |
+| Detect scale | 1.00 | Full resolution; blurry/partial heads need every pixel |
+| Confidence | ~0.25 or lower | For privacy, over-cover; recall matters more than precision |
+| Padding | 0.30+ | The head region is an estimate — extra padding guarantees coverage |
+
+The head/person pass also runs at a lower confidence floor than the face pass
+automatically (`HEAD_CONF_DROP`, default 0.15).
+
+**Verifying it works.** With **Detect whole head** on, the log shows the method
+(`person -> head region` or `dedicated head model (head.pt)`) and, on the first
+frame, `Head model alone: N head(s)`. Turn on **Show debug boxes** to see what's
+being added. Two standalone diagnostics ship alongside the app:
+
+- `test_detect.py path\to\clip.mp4` — compares person vs head detection on your
+  footage (blue = person, yellow = head region, green = head model).
+- `test_head.py path\to\clip.mp4` — runs just a head model.
+
+**Best results on out-of-distribution footage: fine-tune.** No public model is
+trained on helmeted/blurred/tactical heads. For reliable detection, label a few
+hundred frames from your own clips and fine-tune YOLOv8, then save the result as
+`head.pt`. ultralytics makes the training a few lines; the effort is the labeling.
+
+---
+
 ## Known Issues / Pending
 
 - [ ] Slider value display (visual refresh issue on some systems)
@@ -193,7 +254,8 @@ If the GPU version is installed but CUDA is unavailable at runtime, the app disp
 |---|---|---|
 | v1.0 | 2026 | Initial release |
 | v1.0.1 | 2026 | Reduced the size of installer |
+| v1.1 | 2026 | Whole-head detection (optional): person→head-region unioned with an optional `head.pt`, with no double-masking; motion-aware anti-flicker box smoothing (camera-motion compensation, velocity coasting, evidence-graduated hold); per-source debug overlay and counts; CSRT tracking fixes. |
 
 ---
 
-*FACEBLUR v1.0.1 — made by werehappy*
+*FACEBLUR v1.1 — made by werehappy*
