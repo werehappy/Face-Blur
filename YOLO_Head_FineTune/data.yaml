@@ -1,0 +1,15 @@
+# FACEBLUR head-detector training config.
+# Edit `path` to point at your dataset root, then:
+#   yolo detect train model=yolo11n.pt data=data.yaml epochs=100 imgsz=960 batch=8 patience=30 name=head_v1
+#
+# Folder layout this expects:
+#   <path>/images/train , <path>/images/val
+#   <path>/labels/train , <path>/labels/val   (YOLO .txt, one per image)
+
+path: C:/path/to/head_dataset   # <-- CHANGE THIS to your dataset root (absolute path)
+train: images/train
+val: images/val
+
+# Single class. The app auto-detects this 'head' name from the trained model.
+names:
+  0: head
