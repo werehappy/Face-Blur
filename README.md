@@ -1,4 +1,4 @@
-# FACEBLUR v1.1
+# FACEBLUR v1.2
 **Automated face censoring application**
 Made by werehappy
 
@@ -255,7 +255,8 @@ hundred frames from your own clips and fine-tune YOLOv8, then save the result as
 | v1.0 | 2026 | Initial release |
 | v1.0.1 | 2026 | Reduced the size of installer |
 | v1.1 | 2026 | Whole-head detection (optional): person→head-region unioned with an optional `head.pt`, with no double-masking; motion-aware anti-flicker box smoothing (camera-motion compensation, velocity coasting, evidence-graduated hold); per-source debug overlay and counts; CSRT tracking fixes. |
+| v1.2 | 2026 | **Bundled a fine-tuned `head.pt`.** A dedicated head detector was trained on custom footage and now ships with the app, so whole-head mode catches backs/sides/partial heads out of the box instead of relying on the person→head-region estimate alone. The model was produced by **labeling a few hundred frames** from real target clips (the helmeted / motion-blurred / cut-off heads no public model covers) and **fine-tuning YOLO** on them — labeling is the bulk of the work; the training itself is a few lines (see *Whole-Head Detection Setup → Best results on out-of-distribution footage: fine-tune*). Build scripts (`build.bat`, `build_installer.bat`, `installer.iss`) now install `head.pt` next to the exe, where a user-supplied `head.pt` still overrides it. Recommended for hard footage: Frame skip 1, Detect scale 1.00, Confidence ~0.25, Padding 0.30+. |
 
 ---
 
-*FACEBLUR v1.1 — made by werehappy*
+*FACEBLUR v1.2 — made by werehappy*

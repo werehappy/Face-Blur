@@ -3,7 +3,7 @@
 ; torch is downloaded on the user's first launch, sized to their GPU.
 
 #define AppName "FACEBLUR"
-#define AppVersion "1.0.1"
+#define AppVersion "1.2"
 #define AppPublisher "werehappy"
 #define AppExeName "FACEBLUR.exe"
 
