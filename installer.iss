@@ -35,6 +35,9 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 ; Single exe (torch is NOT bundled - downloaded at first run)
 Source: "dist\FACEBLUR.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "ffmpeg.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Trained head detector. Ships next to the exe so the app's "user head.pt
+; wins" path picks it up (no _MEIPASS / no rebuild needed to swap it later).
+Source: "head.pt"; DestDir: "{app}"; Flags: ignoreversion
 ; Bundled embeddable Python (pip-capable, no torch yet). recursesubdirs
 ; copies the whole tree; torch lands inside it on first run.
 Source: "faceblur_env\*"; DestDir: "{app}\faceblur_env"; Flags: ignoreversion recursesubdirs createallsubdirs

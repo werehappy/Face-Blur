@@ -56,6 +56,16 @@ if not exist "%~dp0%FFMPEG_EXE%" (
 )
 echo       ffmpeg OK.
 
+:: head.pt (trained head detector) - required, the installer ships it next to
+:: the exe. Fail early with a clear message rather than a cryptic Inno error.
+if not exist "%~dp0head.pt" (
+    echo [ERROR] head.pt not found next to this script.
+    echo         Place your trained head.pt in: %~dp0
+    pause
+    exit /b 1
+)
+echo       head.pt OK.
+
 :: Step 0: Build-env packages.
 :: NOTE: we install CPU torch in the BUILD env only so PyInstaller can analyze
 :: ultralytics. torch is then EXCLUDED from the exe, so it is never bundled.

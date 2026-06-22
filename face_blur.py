@@ -1,6 +1,6 @@
 """
 face_blur.py — Face Detection & Censoring GUI Application
-Uses YOLOv8-face + OpenCV + Tkinter
+Uses YOLOv11-face + OpenCV + Tkinter
 """
 
 import os
@@ -13,12 +13,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 # Version
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Settings persistence
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".faceblur_settings.json")
 
-SETTINGS_VERSION = "1.1.0"
+SETTINGS_VERSION = "1.2.0"
 
 def load_settings():
     try:
@@ -1076,7 +1076,7 @@ FV = ("Courier New", 11, "bold")
 class App(tk.Tk):
     def __init__(self, gpu_info=None):
         super().__init__()
-        self.title("FACEBLUR v1.1")
+        self.title("FACEBLUR v1.2")
         self.configure(bg=BG)
         self.geometry("960x780")
         self.minsize(900, 700)
@@ -1115,8 +1115,8 @@ class App(tk.Tk):
         top = tk.Frame(self, bg=BG)
         top.pack(fill="x", padx=20, pady=(16, 0))
         tk.Label(top, text="FACEBLUR", bg=BG, fg=ACCENT, font=FH).pack(side="left")
-        tk.Label(top, text="YOLOv8 face censoring", bg=BG, fg=TDIM, font=FS).pack(side="left", padx=12)
-        tk.Label(top, text="v1.1", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left")
+        tk.Label(top, text="YOLOv11 face censoring", bg=BG, fg=TDIM, font=FS).pack(side="left", padx=12)
+        tk.Label(top, text="v1.2", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left")
         tk.Label(top, text="made by werehappy", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left", padx=4)
         # GPU/CPU indicator (right side of top bar)
         if self._gpu_info["torch_cuda"]:
@@ -1394,7 +1394,7 @@ class App(tk.Tk):
             try: self.geometry(settings["geometry"])
             except Exception: pass
         self._update_suffix_preview()
-        self._write_log("FACEBLUR ready.  (YOLOv8-face)\n", "accent")
+        self._write_log("FACEBLUR ready.  (YOLOv11-face)\n", "accent")
         self._write_log("Python: {}{}\n".format(
             sys.executable,
             " [bundled]" if getattr(sys, "frozen", False) else ""), "dim")
@@ -2359,7 +2359,7 @@ class SplashScreen(tk.Tk):
         inner.pack(fill="both", expand=True)
         tk.Label(inner, text="FACEBLUR", bg="#0f0f0f", fg="#00e5ff",
                  font=("Courier New", 32, "bold")).pack(pady=(30, 4))
-        tk.Label(inner, text="YOLOv8 face censoring  v1.1  |  made by werehappy",
+        tk.Label(inner, text="YOLOv11 face censoring  v1.2  |  made by werehappy",
                  bg="#0f0f0f", fg="#444444",
                  font=("Courier New", 9)).pack()
         self._status = tk.Label(inner, text="Starting...",

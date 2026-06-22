@@ -110,6 +110,15 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
+:: Ship head.pt next to the exe (same dir the app looks in for a user model).
+:: Dev build runs dist\FACEBLUR.exe directly, so it must live there too.
+if exist "%~dp0head.pt" (
+    copy /y "%~dp0head.pt" "%~dp0dist\head.pt" >nul
+    echo       head.pt copied to dist\.
+) else (
+    echo [WARN] head.pt not found - app will fall back to head_default.pt.
+)
+
 echo.
 echo ==================================================
 echo   Done!  %~dp0dist\FACEBLUR.exe
