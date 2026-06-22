@@ -3,7 +3,7 @@
 ; torch is downloaded on the user's first launch, sized to their GPU.
 
 #define AppName "FACEBLUR"
-#define AppVersion "1.2"
+#define AppVersion "1.2.1"
 #define AppPublisher "werehappy"
 #define AppExeName "FACEBLUR.exe"
 
@@ -23,6 +23,10 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+; Always show the "Select Destination Location" page. Without this, Inno's
+; default (DisableDirPage=auto) hides it on upgrades when a prior install with
+; the same AppId is detected, silently reusing the old folder.
+DisableDirPage=no
 ArchitecturesInstallIn64BitMode=x64compatible
 
 [Languages]

@@ -13,12 +13,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 # Version
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 # Settings persistence
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".faceblur_settings.json")
 
-SETTINGS_VERSION = "1.2.0"
+SETTINGS_VERSION = "1.2.1"
 
 def load_settings():
     try:
@@ -1076,7 +1076,7 @@ FV = ("Courier New", 11, "bold")
 class App(tk.Tk):
     def __init__(self, gpu_info=None):
         super().__init__()
-        self.title("FACEBLUR v1.2")
+        self.title("FACEBLUR v1.2.1")
         self.configure(bg=BG)
         self.geometry("960x780")
         self.minsize(900, 700)
@@ -1116,7 +1116,7 @@ class App(tk.Tk):
         top.pack(fill="x", padx=20, pady=(16, 0))
         tk.Label(top, text="FACEBLUR", bg=BG, fg=ACCENT, font=FH).pack(side="left")
         tk.Label(top, text="YOLOv11 face censoring", bg=BG, fg=TDIM, font=FS).pack(side="left", padx=12)
-        tk.Label(top, text="v1.2", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left")
+        tk.Label(top, text="v1.2.1", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left")
         tk.Label(top, text="made by werehappy", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left", padx=4)
         # GPU/CPU indicator (right side of top bar)
         if self._gpu_info["torch_cuda"]:
@@ -2347,6 +2347,9 @@ class App(tk.Tk):
 class SplashScreen(tk.Tk):
     def __init__(self):
         super().__init__()
+        # Thread that owns the Tk interpreter. All widget calls must happen here;
+        # set_status() uses this to marshal updates from the background loader.
+        self._tk_thread = threading.get_ident()
         self.overrideredirect(True)
         self.configure(bg="#0f0f0f")
         self.attributes("-topmost", True)
@@ -2359,7 +2362,7 @@ class SplashScreen(tk.Tk):
         inner.pack(fill="both", expand=True)
         tk.Label(inner, text="FACEBLUR", bg="#0f0f0f", fg="#00e5ff",
                  font=("Courier New", 32, "bold")).pack(pady=(30, 4))
-        tk.Label(inner, text="YOLOv11 face censoring  v1.2  |  made by werehappy",
+        tk.Label(inner, text="YOLOv11 face censoring  v1.2.1  |  made by werehappy",
                  bg="#0f0f0f", fg="#444444",
                  font=("Courier New", 9)).pack()
         self._status = tk.Label(inner, text="Starting...",
@@ -2433,14 +2436,37 @@ class SplashScreen(tk.Tk):
         _append_crash("".join(traceback.format_exception(exc, val, tb)))
         self.show_error("Startup error - see faceblur_crash.txt")
 
+    def _apply_status(self, msg, pct):
+        if getattr(self, "_closed", False):
+            return
+        try:
+            self._status.config(text=msg)
+            self._pb.place(x=0, y=0,
+                           width=int(self._pb_width * max(0.0, min(1.0, pct))),
+                           height=3)
+        except Exception:
+            pass
+
     def set_status(self, msg, pct):
         if getattr(self, "_closed", False):
             return
-        self._status.config(text=msg)
-        self._pb.place(x=0, y=0,
-                       width=int(self._pb_width * max(0.0, min(1.0, pct))),
-                       height=3)
-        self.update()
+        # Tkinter is single-threaded: widgets may only be touched from the
+        # thread that owns the interpreter (the one running mainloop). The
+        # background loader calls this, so when we're off that thread we MUST
+        # marshal the update via after() instead of poking widgets and calling
+        # update() directly. Cross-thread update() races mainloop and is what
+        # made the first launch intermittently hang / need several reopens.
+        if threading.get_ident() == self._tk_thread:
+            self._apply_status(msg, pct)
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
+        else:
+            try:
+                self.after(0, self._apply_status, msg, pct)
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════════════════
