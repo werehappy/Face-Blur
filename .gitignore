@@ -50,3 +50,14 @@ venv/
 Thumbs.db
 desktop.ini
 files.zip 
+
+YOLO_Head_FineTune/clips/
+YOLO_Head_FineTune/test_clip/
+YOLO_Head_FineTune/files
+YOLO_Head_FineTune/YoloLabel-Windows-x64/
+YOLO_Head_FineTune/dataset_labels/
+YOLO_Head_FineTune/head_dataset/
+YOLO_Head_FineTune/runs/
+
+*.mp4
+*.zip

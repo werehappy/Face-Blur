@@ -1,0 +1,27 @@
+[
+  {
+    "file": "clip1.mp4",
+    "output": "C:\\Users\\seoul\\Desktop\\Joontae\\executable\\YOLO Setup\\YOLO_Head_FineTune\\clip1_pixelated.mp4",
+    "frames": 6307,
+    "faces_total": 13307,
+    "duration_s": 2772.23,
+    "fps": 2.3,
+    "settings": {
+      "mode": "Pixelate",
+      "model_key": "nano  (fastest)",
+      "confidence": 0.5,
+      "padding": 0.15,
+      "intensity": 53,
+      "block_size": 40,
+      "debug": false,
+      "outdir": null,
+      "skip_frames": 1,
+      "detect_scale": 0.8,
+      "suffix": "_pixelated",
+      "edge_strip": true,
+      "detect_head": true,
+      "smooth_boxes": false,
+      "export_report": true
+    }
+  }
+]

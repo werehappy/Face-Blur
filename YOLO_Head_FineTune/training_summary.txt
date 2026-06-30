@@ -1,0 +1,12 @@
+========================================================================
+SUMMARY  (imgsz=960)
+------------------------------------------------------------------------
+size   status     recall    mAP50   mAP5095  minutes  weights
+n      ok          0.714    0.791     0.388     60.7  head_n.pt
+s      ok          0.712    0.789     0.384    186.4  head_s.pt
+m      ok          0.662    0.754     0.367    541.4  head_m.pt
+------------------------------------------------------------------------
+For a privacy blur, RECALL is the metric that matters most.
+Pick the size by recall-vs-speed: ship that head_<size>.pt as
+head.pt, and set HEAD_INFER_IMGSZ=960 in face_blur.py.
+========================================================================

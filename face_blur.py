@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 # Version
-VERSION = "1.2.1"
+VERSION = "1.3"
 
 # Settings persistence
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".faceblur_settings.json")
@@ -252,6 +252,18 @@ _detector_cache = {}
 # like face-only.
 HEAD_MODEL_FILE = "head.pt"        # user-provided / fine-tuned head model (takes priority)
 
+# Selectable fine-tuned head models by size (produced by train_all.py). The
+# OPTIONS selector picks one; all are treated as user models, so the person->head
+# geometry pass is disabled when any of them is loaded (see PERSON_HEAD_MODE).
+# A legacy single head.pt is still honored as a fallback. IMPORTANT: all three
+# must be trained at HEAD_INFER_IMGSZ (960) so inference matches training.
+HEAD_MODELS = {
+    "nano (fastest)":   "head_n.pt",
+    "small (balanced)": "head_s.pt",
+    "medium (best)":    "head_m.pt",
+}
+HEAD_MODEL_DEFAULT_KEY = "small (balanced)"
+
 # COCO person detector -> head region. Loaded via an EXPLICIT URL (the same robust
 # urllib path the face models use) instead of relying on ultralytics' internal
 # auto-downloader. The internal downloader frequently fails inside the frozen
@@ -291,6 +303,29 @@ HEAD_DEFAULT_URL  = "https://raw.githubusercontent.com/Abcfsa/YOLOv8_head_detect
 # Heads (esp. backs/partials) score LOWER than faces, so run the head/person pass
 # at a lower confidence floor than the face pass (face conf minus this, min 0.15).
 HEAD_CONF_DROP = 0.15
+
+# Inference size for the dedicated head model (head.pt / head_default.pt).
+# This MUST match the imgsz the head model was TRAINED at. ultralytics defaults
+# to 640 when no imgsz is given; running a 960-trained head model at any other
+# size shifts how small bright objects (e.g. weapon illuminators) are scaled and
+# can make them get misread as heads at high confidence. Keep this equal to your
+# head.pt training imgsz. Face/person passes are left at the default (640) since
+# those models were trained at 640.
+HEAD_INFER_IMGSZ = 960
+
+# --- Person->head geometry pass: demotion policy -----------------------------
+# The person->head pass ESTIMATES a head box from a COCO person box (sized by
+# shoulder width). It is robust to blur/helmets/cut-off bodies, but it is pure
+# GEOMETRY, not detection: on gear-forward poses the person box widens to include
+# an extended weapon, and the estimated head region can land on the muzzle (e.g.
+# a weapon illuminator), painting a censor where there is no head. With a
+# fine-tuned head.pt now doing primary detection, this pass is demoted.
+#   "user_off" : person->head runs UNLESS your own head.pt is loaded (default).
+#                Users with only the auto-downloaded default keep it as a fallback.
+#   "any_off"  : person->head runs only when NO head model is loaded at all.
+#   "always"   : legacy behavior -- person->head always unions in.
+#   "never"    : person->head fully disabled.
+PERSON_HEAD_MODE = "user_off"
 
 # Whole-head mode: a face box is treated as ALREADY covered (and dropped, to
 # avoid double-masking the same head) when at least this fraction of the RAW
@@ -336,7 +371,7 @@ def get_detector(model_key, log_fn=None):
     filename, url = YOLO_MODELS[model_key]
     return get_detector_by_file(filename, url, log_fn)
 
-def get_head_detector(log_fn=None):
+def get_head_detector(head_size=None, log_fn=None):
     """Load the whole-head detectors. Returns (head_model, person_model).
     BOTH are loaded and used together (union of their boxes):
       head_model   -- head.pt next to the app (direct head boxes; catches heads
@@ -344,17 +379,28 @@ def get_head_detector(log_fn=None):
       person_model -- COCO person detector -> head region (robust to blur,
                       helmets, partial bodies). None if it cannot load.
     """
+def get_head_detector(head_size=None, log_fn=None):
     head_model = None
-    # 1) A head model the user dropped in (CrowdHuman-trained or fine-tuned on
-    #    your own footage) ALWAYS takes priority.
-    if os.path.exists(HEAD_MODEL_FILE):
-        try:
-            head_model = get_detector_by_file(HEAD_MODEL_FILE, None, log_fn)
-            if log_fn:
-                log_fn("  Head model: using your {}.\n".format(HEAD_MODEL_FILE), "success")
-        except Exception as e:
-            if log_fn:
-                log_fn("  [WARN] {} failed to load ({}).\n".format(HEAD_MODEL_FILE, e), "warning")
+    head_is_user = False
+    # 1) The selected fine-tuned size model (head_n/s/m.pt) first, then a legacy
+    #    single head.pt as a fallback/manual override. Both count as "user"
+    #    models, which demotes the person->head pass (see PERSON_HEAD_MODE).
+    candidates = []
+    if head_size and head_size in HEAD_MODELS:
+        candidates.append(HEAD_MODELS[head_size])
+    if HEAD_MODEL_FILE not in candidates:
+        candidates.append(HEAD_MODEL_FILE)
+    for cand in candidates:
+        if os.path.exists(cand):
+            try:
+                head_model = get_detector_by_file(cand, None, log_fn)
+                head_is_user = True
+                if log_fn:
+                    log_fn("  Head model: using {}.\n".format(cand), "success")
+                break
+            except Exception as e:
+                if log_fn:
+                    log_fn("  [WARN] {} failed to load ({}).\n".format(cand, e), "warning")
     # 2) Otherwise auto-download a default head model (to a SEPARATE file, so a
     #    user head.pt added later still wins and this is never overwritten).
     if head_model is None and HEAD_DEFAULT_URL:
@@ -374,7 +420,7 @@ def get_head_detector(log_fn=None):
     except Exception as e:
         if log_fn:
             log_fn("  [WARN] person model failed to load ({}).\n".format(e), "warning")
-    return head_model, person_model
+    return head_model, person_model, head_is_user
 
 def _head_class_ids(detector):
     """Figure out which class id(s) a head model uses for 'head'.
@@ -644,10 +690,15 @@ class BoxSmoother:
         return [(int(t["x1"]), int(t["y1"]), int(t["x2"]), int(t["y2"]),
                  t["score"]) for t in self.tracks]
 
-def _run_yolo(detector, frame, confidence, classes=None):
+def _run_yolo(detector, frame, confidence, classes=None, imgsz=None):
     """Run YOLO on a single frame and return list of (x1,y1,x2,y2,score).
-    classes: optional list of class ids to keep (e.g. [0]=person for COCO)."""
-    results = detector(frame, conf=confidence, verbose=False, workers=0, classes=classes)
+    classes: optional list of class ids to keep (e.g. [0]=person for COCO).
+    imgsz: inference size. When None, ultralytics uses its default (640). Set it
+    to the model's training size to avoid train/inference scale mismatch."""
+    kwargs = dict(conf=confidence, verbose=False, workers=0, classes=classes)
+    if imgsz is not None:
+        kwargs["imgsz"] = imgsz
+    results = detector(frame, **kwargs)
     boxes = []
     for result in results:
         if result.boxes is None:
@@ -681,11 +732,13 @@ def _dedup_boxes(boxes, iou_thresh=0.4):
     return kept
 
 def detect_faces(frame, detector, confidence, detect_scale=0.5, edge_strip=True, classes=None,
-                 edge_conf_drop=0.1):
+                 edge_conf_drop=0.1, imgsz=None):
     """
     Run YOLO on downscaled frame + edge strips for partial/out-of-frame faces.
     Returns list of (x1, y1, x2, y2, score).
     classes: optional list of class ids to keep (e.g. [0]=person).
+    imgsz: inference size passed to YOLO (None = ultralytics default 640). Set to
+    the detector's training size to keep inference scale-matched to training.
     """
     h, w = frame.shape[:2]
 
@@ -694,13 +747,13 @@ def detect_faces(frame, detector, confidence, detect_scale=0.5, edge_strip=True,
         sw = max(32, int(w * detect_scale))
         sh = max(32, int(h * detect_scale))
         small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_LINEAR)
-        raw = _run_yolo(detector, small, confidence, classes)
+        raw = _run_yolo(detector, small, confidence, classes, imgsz=imgsz)
         # Scale coords back up
         boxes = [(int(x1/detect_scale), int(y1/detect_scale),
                   int(x2/detect_scale), int(y2/detect_scale), s)
                  for (x1, y1, x2, y2, s) in raw]
     else:
-        boxes = _run_yolo(detector, frame, confidence, classes)
+        boxes = _run_yolo(detector, frame, confidence, classes, imgsz=imgsz)
 
     # Edge strip passes (20% of each side, full resolution)
     if edge_strip:
@@ -715,7 +768,7 @@ def detect_faces(frame, detector, confidence, detect_scale=0.5, edge_strip=True,
             strip = frame[sy1:sy2, sx1:sx2]
             if strip.size == 0:
                 continue
-            raw = _run_yolo(detector, strip, max(0.1, confidence - edge_conf_drop), classes)
+            raw = _run_yolo(detector, strip, max(0.1, confidence - edge_conf_drop), classes, imgsz=imgsz)
             for (x1, y1, x2, y2, s) in raw:
                 # Translate back to full frame coords
                 boxes.append((x1+sx1, y1+sy1, x2+sx1, y2+sy1, s))
@@ -789,8 +842,25 @@ def _merge_face_head(face_boxes, head_boxes):
             merged.append(fb)
     return _dedup_boxes(merged)
 
+def _person_head_active(head_model, head_is_user):
+    """Whether the person->head GEOMETRY pass should contribute boxes, per
+    PERSON_HEAD_MODE. The pass estimates a head from a body box and can land on
+    forward-held gear/weapons, so it is demoted once a real head model is doing
+    the work. See PERSON_HEAD_MODE for the policy options."""
+    mode = PERSON_HEAD_MODE
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    if mode == "any_off":
+        return head_model is None
+    # default "user_off": disable when YOUR own head.pt is the active model
+    return not head_is_user
+
+
 def detect_objects(frame, face_detector, head_model, person_model, confidence,
-                   detect_scale=0.5, edge_strip=True, detect_head=False):
+                   detect_scale=0.5, edge_strip=True, detect_head=False,
+                   head_is_user=False):
     """Detect faces, and optionally whole heads, then merge (union).
 
     Whole-head mode runs UP TO TWO extra passes and unions everything:
@@ -818,7 +888,7 @@ def detect_objects(frame, face_detector, head_model, person_model, confidence,
     # Backs/sides of heads score lower than faces -> use a lower floor here.
     head_conf = max(0.15, confidence - HEAD_CONF_DROP)
     extra = []
-    if person_model is not None:
+    if person_model is not None and _person_head_active(head_model, head_is_user):
         # Full resolution regardless of the Detect-scale slider: small/partial/
         # side-on bodies vanish at 0.5x and the person pass then finds nothing,
         # which is a common reason whole-head mode "did nothing". Person boxes are
@@ -835,7 +905,7 @@ def detect_objects(frame, face_detector, head_model, person_model, confidence,
         # false-positive factory).
         model_heads = detect_faces(frame, head_model, head_conf, 1.0,
                                    edge_strip, classes=head_classes,
-                                   edge_conf_drop=0.0)
+                                   edge_conf_drop=0.0, imgsz=HEAD_INFER_IMGSZ)
         LAST_DETECT_BREAKDOWN["head"] = list(model_heads)
         extra.extend(model_heads)
     # Drop face boxes that a head/person box already covers BEFORE growing them,
@@ -1076,7 +1146,7 @@ FV = ("Courier New", 11, "bold")
 class App(tk.Tk):
     def __init__(self, gpu_info=None):
         super().__init__()
-        self.title("FACEBLUR v1.2.1")
+        self.title("FACEBLUR v1.3")
         self.configure(bg=BG)
         self.geometry("960x780")
         self.minsize(900, 700)
@@ -1103,6 +1173,7 @@ class App(tk.Tk):
         self._suffix       = tk.StringVar(self, value="_blurred")
         self._edge_strip   = tk.BooleanVar(self, value=True)
         self._detect_head  = tk.BooleanVar(self, value=False)
+        self._head_size    = tk.StringVar(self, value=HEAD_MODEL_DEFAULT_KEY)
         self._smooth_boxes = tk.BooleanVar(self, value=True)
         self._export_report = tk.BooleanVar(self, value=False)
         self._file_status  = {}
@@ -1116,7 +1187,7 @@ class App(tk.Tk):
         top.pack(fill="x", padx=20, pady=(16, 0))
         tk.Label(top, text="FACEBLUR", bg=BG, fg=ACCENT, font=FH).pack(side="left")
         tk.Label(top, text="YOLOv11 face censoring", bg=BG, fg=TDIM, font=FS).pack(side="left", padx=12)
-        tk.Label(top, text="v1.2.1", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left")
+        tk.Label(top, text="v1.3", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left")
         tk.Label(top, text="made by werehappy", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left", padx=4)
         # GPU/CPU indicator (right side of top bar)
         if self._gpu_info["torch_cuda"]:
@@ -1301,6 +1372,24 @@ class App(tk.Tk):
                        bg=BG, fg=TMID, font=FS, selectcolor=BG3,
                        activebackground=BG, activeforeground=ACCENT
                        ).pack(side="left", padx=(12, 0))
+
+        # Head-model size selector (used when 'Detect whole head' is on).
+        head_row = tk.Frame(self._opts_body, bg=BG)
+        head_row.pack(fill="x", padx=8, pady=(2, 4))
+        tk.Label(head_row, text="Head model size:", bg=BG, fg=TMID,
+                 font=FS).pack(side="left")
+        _head_om = tk.OptionMenu(head_row, self._head_size, *HEAD_MODELS.keys())
+        _head_om.config(bg=BG3, fg=TEXT, font=FS, activebackground=BG3,
+                        activeforeground=ACCENT, highlightthickness=0,
+                        bd=0, cursor="hand2")
+        try:
+            _head_om["menu"].config(bg=BG3, fg=TEXT, activebackground=ACCENT,
+                                    activeforeground=BG, font=FS)
+        except Exception:
+            pass
+        _head_om.pack(side="left", padx=6)
+        tk.Label(head_row, text="(needs 'Detect whole head' on; bigger = more "
+                 "accurate, slower)", bg=BG, fg=TDIM, font=FS).pack(side="left")
 
         suffix_row = tk.Frame(self._opts_body, bg=BG)
         suffix_row.pack(fill="x", padx=8, pady=(0, 8))
@@ -1498,6 +1587,7 @@ class App(tk.Tk):
         self._debug.set(False)
         self._edge_strip.set(True)
         self._detect_head.set(False)
+        self._head_size.set(HEAD_MODEL_DEFAULT_KEY)
         self._smooth_boxes.set(True)
         self._export_report.set(False)
         self._mode.set("Blur")
@@ -1648,6 +1738,7 @@ class App(tk.Tk):
             "suffix": self._suffix.get(), "edge_strip": self._edge_strip.get(),
             "export_report": self._export_report.get(), "geometry": self.geometry(),
             "detect_head": self._detect_head.get(),
+            "head_size": self._head_size.get(),
             "smooth_boxes": self._smooth_boxes.get(),
         }
         save_settings(data)
@@ -1660,12 +1751,12 @@ class App(tk.Tk):
             keys = ["mode", "model_key", "confidence", "padding", "blur_k",
                     "pixel_sz", "debug", "skip_frames", "detect_scale",
                     "outdir", "suffix", "edge_strip", "export_report",
-                    "detect_head", "smooth_boxes"]
+                    "detect_head", "smooth_boxes", "head_size"]
             targets = [self._mode, self._model_key, self._conf, self._pad,
                        self._blur_k, self._pixel_sz, self._debug,
                        self._skip_frames, self._detect_scale, self._outdir,
                        self._suffix, self._edge_strip, self._export_report,
-                       self._detect_head, self._smooth_boxes]
+                       self._detect_head, self._smooth_boxes, self._head_size]
             for k, t in zip(keys, targets):
                 if k in data:
                     t.set(data[k])
@@ -1883,18 +1974,22 @@ class App(tk.Tk):
                 detector = get_detector(cfg["model_key"], log_fn=None)
                 head_model = None
                 person_model = None
+                head_is_user = False
                 if cfg.get("detect_head"):
                     try:
-                        head_model, person_model = get_head_detector(log_fn=None)
+                        head_model, person_model, head_is_user = get_head_detector(
+                            head_size=cfg.get("head_size"), log_fn=None)
                     except Exception:
                         head_model = person_model = None
+                        head_is_user = False
                 cap = cv2.VideoCapture(path)
                 ok, frame = cap.read()
                 cap.release()
                 if not ok: return
                 boxes = detect_objects(frame, detector, head_model, person_model,
                                        cfg["confidence"], cfg["detect_scale"],
-                                       cfg["edge_strip"], cfg.get("detect_head", False))
+                                       cfg["edge_strip"], cfg.get("detect_head", False),
+                                       head_is_user=head_is_user)
                 preview = apply_censor(frame.copy(), boxes,
                                        cfg["mode"], cfg["padding"],
                                        cfg["intensity"], cfg["block_size"],
@@ -1917,7 +2012,7 @@ class App(tk.Tk):
                 if cfg.get("detect_head"):
                     try:
                         hc = max(0.15, cfg["confidence"] - HEAD_CONF_DROP)
-                        if person_model is not None:
+                        if person_model is not None and _person_head_active(head_model, head_is_user):
                             hr = detect_faces(frame, person_model, hc,
                                               1.0, edge_strip=False,
                                               classes=[HEAD_PERSON_CLASS])
@@ -1925,10 +2020,14 @@ class App(tk.Tk):
                             self._write_log("  Person -> head regions: {} "
                                             "on first frame\n".format(len(hb)),
                                             "dim" if hb else "warning")
+                        elif person_model is not None:
+                            self._write_log("  Person -> head pass: disabled "
+                                            "(head.pt is primary)\n", "dim")
                         if head_model is not None:
                             hb2 = detect_faces(frame, head_model, hc, 1.0,
                                                cfg["edge_strip"],
-                                               classes=_head_class_ids(head_model))
+                                               classes=_head_class_ids(head_model),
+                                               imgsz=HEAD_INFER_IMGSZ)
                             self._write_log("  Head model alone: {} head(s) "
                                             "on first frame\n".format(len(hb2)),
                                             "dim" if hb2 else "warning")
@@ -1963,6 +2062,7 @@ class App(tk.Tk):
             "suffix":        MODE_SUFFIX.get(self._mode.get(), "_blurred"),
             "edge_strip":    self._edge_strip.get(),
             "detect_head":   self._detect_head.get(),
+            "head_size":     self._head_size.get(),
             "smooth_boxes":  self._smooth_boxes.get(),
             "export_report": self._export_report.get(),
         }
@@ -1999,12 +2099,15 @@ class App(tk.Tk):
 
         head_model = None
         person_model = None
+        head_is_user = False
         if cfg.get("detect_head"):
             self._write_log("Whole-head detection ON. Loading head detectors...\n", "accent")
             try:
-                head_model, person_model = get_head_detector(log_fn=self._write_log)
+                head_model, person_model, head_is_user = get_head_detector(
+                    head_size=cfg.get("head_size"), log_fn=self._write_log)
                 methods = []
-                if person_model is not None:
+                person_on = person_model is not None and _person_head_active(head_model, head_is_user)
+                if person_on:
                     methods.append("person -> head region")
                 if head_model is not None:
                     methods.append("dedicated head model (head.pt)")
@@ -2022,6 +2125,10 @@ class App(tk.Tk):
                                 head_model.names), "dim")
                         except Exception:
                             pass
+                    if person_model is not None and not person_on:
+                        self._write_log("  Person -> head pass: disabled "
+                                        "(your head.pt is primary; avoids "
+                                        "weapon/gear false boxes).\n", "dim")
                 else:
                     self._write_log("[ERROR] Whole-head is ON but NO head/person "
                                     "model loaded -> this run will be FACE-ONLY.\n"
@@ -2141,7 +2248,8 @@ class App(tk.Tk):
                     boxes = detect_objects(frame, detector, head_model, person_model,
                                            cfg["confidence"], dscale,
                                            cfg["edge_strip"],
-                                           cfg.get("detect_head", False))
+                                           cfg.get("detect_head", False),
+                                           head_is_user=head_is_user)
                     if use_tracker:
                         try: tracker.update_from_detection(frame, boxes)
                         except Exception: use_tracker = False
@@ -2362,7 +2470,7 @@ class SplashScreen(tk.Tk):
         inner.pack(fill="both", expand=True)
         tk.Label(inner, text="FACEBLUR", bg="#0f0f0f", fg="#00e5ff",
                  font=("Courier New", 32, "bold")).pack(pady=(30, 4))
-        tk.Label(inner, text="YOLOv11 face censoring  v1.2.1  |  made by werehappy",
+        tk.Label(inner, text="YOLOv11 face censoring  v1.3  |  made by werehappy",
                  bg="#0f0f0f", fg="#444444",
                  font=("Courier New", 9)).pack()
         self._status = tk.Label(inner, text="Starting...",
@@ -2375,6 +2483,11 @@ class SplashScreen(tk.Tk):
         self._pb = tk.Frame(pb_outer, bg="#00e5ff", height=3)
         self._pb.place(x=0, y=0, width=0, height=3)
         self._pb_width = 340
+        # Busy-animation state (used for the long first-run torch download).
+        self._indeterminate = False
+        self._anim_job = None
+        self._indet_base = ""
+        self._indet_start = 0.0
 
         # The splash is borderless (no X) and topmost. If loading ever fails,
         # it must still be closeable instead of floating forever.
@@ -2439,6 +2552,11 @@ class SplashScreen(tk.Tk):
     def _apply_status(self, msg, pct):
         if getattr(self, "_closed", False):
             return
+        if self._indeterminate:
+            # The marquee animation owns the bar and the status text; just record
+            # the latest message so the animator shows it with the elapsed clock.
+            self._indet_base = msg
+            return
         try:
             self._status.config(text=msg)
             self._pb.place(x=0, y=0,
@@ -2446,6 +2564,67 @@ class SplashScreen(tk.Tk):
                            height=3)
         except Exception:
             pass
+
+    def start_indeterminate(self, base_msg="Working"):
+        """Busy animation + elapsed clock for long, percentage-less work (the
+        first-run torch download, which can be a 2.5GB CUDA wheel). A moving bar
+        and a ticking timer prove the app is alive, not frozen. Any thread."""
+        if getattr(self, "_closed", False):
+            return
+        if threading.get_ident() != self._tk_thread:
+            try:
+                self.after(0, self.start_indeterminate, base_msg)
+            except Exception:
+                pass
+            return
+        if self._indeterminate:
+            self._indet_base = base_msg
+            return
+        self._indeterminate = True
+        self._indet_base = base_msg
+        self._indet_start = time.time()
+        self._marquee_x = 0
+        self._marquee_dir = 1
+        self._animate_marquee()
+
+    def _animate_marquee(self):
+        if getattr(self, "_closed", False) or not self._indeterminate:
+            return
+        seg = 70
+        track = self._pb_width
+        self._marquee_x += self._marquee_dir * 14
+        if self._marquee_x <= 0:
+            self._marquee_x, self._marquee_dir = 0, 1
+        elif self._marquee_x >= track - seg:
+            self._marquee_x, self._marquee_dir = track - seg, -1
+        try:
+            self._pb.place(x=self._marquee_x, y=0, width=seg, height=3)
+            elapsed = int(time.time() - self._indet_start)
+            self._status.config(text="{}  ({}:{:02d})".format(
+                self._indet_base, elapsed // 60, elapsed % 60))
+        except Exception:
+            pass
+        try:
+            self._anim_job = self.after(45, self._animate_marquee)
+        except Exception:
+            pass
+
+    def stop_indeterminate(self):
+        """Stop the busy animation and hand the bar back to set_status. Any thread."""
+        if threading.get_ident() != self._tk_thread:
+            try:
+                self.after(0, self.stop_indeterminate)
+            except Exception:
+                pass
+            return
+        self._indeterminate = False
+        job = getattr(self, "_anim_job", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+            self._anim_job = None
 
     def set_status(self, msg, pct):
         if getattr(self, "_closed", False):
@@ -2613,12 +2792,29 @@ def _install_torch_first_run(splash):
         _status("Installing libraries...", 0.55)
 
     ok = False
+    # Show a moving bar + elapsed clock across the (long, percentage-less) pip
+    # download/install so the splash is visibly ALIVE. On a machine with an
+    # Nvidia GPU this pulls a ~2.5GB CUDA build, which legitimately takes many
+    # minutes -- without this it looks frozen at "Installing libraries...".
+    if gpu.get("has_nvidia") and cuda_ver:
+        _base = "Downloading GPU libraries (one-time, ~2.5GB)"
+    else:
+        _base = "Installing libraries (one-time)"
+    try:
+        splash.start_indeterminate(_base)
+    except Exception:
+        pass
     try:
         ok = install_torch_for_cuda(cuda_ver, log_fn=_pip_log,
                                     has_nvidia=gpu.get("has_nvidia", False))
     except Exception as e:
         _log.append("install_torch_for_cuda raised: {}".format(e))
         ok = False
+    finally:
+        try:
+            splash.stop_indeterminate()
+        except Exception:
+            pass
 
     _write_debug(_log)
 

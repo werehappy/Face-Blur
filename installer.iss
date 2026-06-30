@@ -3,7 +3,7 @@
 ; torch is downloaded on the user's first launch, sized to their GPU.
 
 #define AppName "FACEBLUR"
-#define AppVersion "1.2.1"
+#define AppVersion "1.3"
 #define AppPublisher "werehappy"
 #define AppExeName "FACEBLUR.exe"
 
@@ -39,9 +39,12 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 ; Single exe (torch is NOT bundled - downloaded at first run)
 Source: "dist\FACEBLUR.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "ffmpeg.exe"; DestDir: "{app}"; Flags: ignoreversion
-; Trained head detector. Ships next to the exe so the app's "user head.pt
-; wins" path picks it up (no _MEIPASS / no rebuild needed to swap it later).
-Source: "head.pt"; DestDir: "{app}"; Flags: ignoreversion
+; Fine-tuned head detectors (size-selectable in the app's OPTIONS). Ship next
+; to the exe so the app's head-model loader finds them. All trained at imgsz 960
+; to match HEAD_INFER_IMGSZ. A legacy head.pt, if present, still works too.
+Source: "head_n.pt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "head_s.pt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "head_m.pt"; DestDir: "{app}"; Flags: ignoreversion
 ; Bundled embeddable Python (pip-capable, no torch yet). recursesubdirs
 ; copies the whole tree; torch lands inside it on first run.
 Source: "faceblur_env\*"; DestDir: "{app}\faceblur_env"; Flags: ignoreversion recursesubdirs createallsubdirs

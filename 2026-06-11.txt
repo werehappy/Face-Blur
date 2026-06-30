@@ -1,0 +1,82 @@
+FACEBLUR — work recap, 2026-06-11
+
+Goal for the day: push detection past "faces only" to also catch the WHOLE head
+(including the back of the head), and add a checkbox to toggle it. This turned
+into a multi-step hunt for an approach that actually works on real footage.
+
+## What we tried, in order
+
+**1. Person -> head-region (first attempt), shipped as v1.1.**
+Added the "Detect whole head" checkbox in OPTIONS, wired through settings
+persistence, reset-to-defaults, the run config, and box merging. Bumped the app
+to v1.1 and updated the README. This first version estimated the head as the top
+35% of a COCO person box.
+
+**2. Dedicated head model (pivot).**
+That didn't catch backs of heads — especially when the body was out of frame —
+so we switched to a real head-detection model: a robust loader (local file or
+auto-download), automatic class detection from the model's own names, lower
+head-pass confidence (backs/sides of heads score lower than faces), and graceful
+fallback so the app never breaks.
+
+**3. Verified the head model for real.**
+Still seeing face-only, so instead of guessing we installed ultralytics in a
+sandbox and confirmed a GitHub-hosted SCUT-HEAD model genuinely loads and detects
+heads on a test image. Pointed the app at it and added diagnostic logging.
+
+**4. Built standalone diagnostics.**
+Still face-only on the target machine, so we made test_head.py to run a head
+model on your own frames and save annotated output — to stop debugging blind.
+That conversation surfaced the key fact: the footage is CQB headcam (dynamic
+camera motion, motion blur, helmets/tactical gear, cut-off heads).
+
+**5. Found the real answer with data.**
+test_head.py confirmed the head model catches no back-of-head in this footage
+(it's out-of-distribution — public head models are trained on civilian,
+unhelmeted, sharp images). So we built test_detect.py to compare PERSON vs HEAD
+detection on your clips. Person detection won decisively: 21 detections vs 7
+across 6 sampled frames, including a frame where the head model found nothing.
+
+## Where we landed (current state)
+
+Whole-head mode now defaults to PERSON detection -> head region, using
+width-based geometry (head ~ 0.45x shoulder width wide, 0.55x tall, top-centered)
+which is robust to the cut-off bodies in this footage. The integrated path was
+verified through the real detect_objects function.
+
+Important: a local head.pt ALWAYS overrides the person method. So a model you
+fine-tune later on your own footage drops straight in as head.pt with no code
+change and no rebuild.
+
+Deliverables:
+- face_blur.py  (v1.1, person-region default + head.pt override)
+- README.md     (updated for v1.1 and the new whole-head behavior)
+- test_head.py  (run a head model on your frames, save annotated output)
+- test_detect.py (compare person vs head detection: blue=person, yellow=head
+  region, green=head model)
+
+Recommended UI settings for this footage:
+- Frame skip   = 1     (don't rely on tracking under fast camera motion)
+- Detect scale = 1.00  (full resolution; blurry/partial heads need every pixel)
+- Confidence   ~ 0.25  (for privacy, over-cover; recall over precision)
+- Padding      >= 0.30 (the head region is an estimate; padding guarantees cover)
+- Show debug boxes = ON (for the first run, to see the regions landing on people)
+
+## Honest expectations
+
+The person-region method reliably covers anyone with a visible torso (most people
+in frame, per the test). It will still miss a head that is blurred AND has no
+body visible (e.g. just a helmet edge around a corner). Because it's a region
+estimate, it will occasionally over-cover a bit of shoulder/wall — the right
+trade for privacy, tunable via padding/confidence.
+
+## Next step
+
+Test this build on the clips. If the hardest cases still aren't covered, the real
+fix is fine-tuning a model on your own footage and saving it as head.pt:
+- a frame-sampling script to pull diverse, well-spaced frames to label
+- the labeling workflow
+- the YOLOv8 training command that outputs head.pt
+
+To kick that off, decide roughly how many clips / hours of footage you can pull
+frames from.

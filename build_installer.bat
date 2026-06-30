@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 echo.
 echo ==================================================
-echo   FACEBLUR  --  Build Installer (small / no torch bundled)
+echo   FACEBLUR v1.3  --  Build Installer (small / no torch bundled)
 echo ==================================================
 echo.
 
@@ -56,15 +56,18 @@ if not exist "%~dp0%FFMPEG_EXE%" (
 )
 echo       ffmpeg OK.
 
-:: head.pt (trained head detector) - required, the installer ships it next to
+:: head models (size-selectable) - required, the installer ships them next to
 :: the exe. Fail early with a clear message rather than a cryptic Inno error.
-if not exist "%~dp0head.pt" (
-    echo [ERROR] head.pt not found next to this script.
-    echo         Place your trained head.pt in: %~dp0
-    pause
-    exit /b 1
+for %%M in (head_n.pt head_s.pt head_m.pt) do (
+    if not exist "%~dp0%%M" (
+        echo [ERROR] %%M not found next to this script.
+        echo         Place head_n.pt, head_s.pt and head_m.pt in: %~dp0
+        echo         ^(train them with train_all.py^)
+        pause
+        exit /b 1
+    )
 )
-echo       head.pt OK.
+echo       head models OK.
 
 :: Step 0: Build-env packages.
 :: NOTE: we install CPU torch in the BUILD env only so PyInstaller can analyze

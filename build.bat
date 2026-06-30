@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 echo.
 echo ==================================================
-echo   FACEBLUR  --  Dev Build
+echo   FACEBLUR v1.3  --  Dev Build
 echo ==================================================
 echo.
 
@@ -110,13 +110,19 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
-:: Ship head.pt next to the exe (same dir the app looks in for a user model).
-:: Dev build runs dist\FACEBLUR.exe directly, so it must live there too.
-if exist "%~dp0head.pt" (
-    copy /y "%~dp0head.pt" "%~dp0dist\head.pt" >nul
-    echo       head.pt copied to dist\.
+:: Ship head models next to the exe (same dir the app looks in for them).
+:: Dev build runs dist\FACEBLUR.exe directly, so they must live there too.
+set _HEAD_OK=0
+for %%M in (head_n.pt head_s.pt head_m.pt) do (
+    if exist "%~dp0%%M" (
+        copy /y "%~dp0%%M" "%~dp0dist\%%M" >nul
+        set _HEAD_OK=1
+    )
+)
+if "%_HEAD_OK%"=="1" (
+    echo       head model(s) copied to dist\.
 ) else (
-    echo [WARN] head.pt not found - app will fall back to head_default.pt.
+    echo [WARN] no head_n/s/m.pt found - app will fall back to head_default.pt.
 )
 
 echo.

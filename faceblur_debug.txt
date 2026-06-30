@@ -1,0 +1,4 @@
+Venv path: C:\Users\seoul\Desktop\Joontae\executable\YOLO Setup\faceblur_env
+Venv exists: True
+Already on path: C:\Users\seoul\Desktop\Joontae\executable\YOLO Setup\faceblur_env\Lib\site-packages
+Result: found
