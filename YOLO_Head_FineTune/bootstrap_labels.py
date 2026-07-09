@@ -34,7 +34,7 @@ import sys
 import glob
 import argparse
 
-PERSON_MODEL = "head.pt"   # COCO; ultralytics auto-downloads on first use
+PERSON_MODEL = "head_n.pt"   # COCO; ultralytics auto-downloads on first use
 PERSON_CLASS = 0
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 

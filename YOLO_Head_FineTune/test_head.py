@@ -22,7 +22,7 @@ or the INTEGRATION is.
 """
 import os, sys, urllib.request
 
-HEAD_MODEL_FILE = "head.pt"
+HEAD_MODEL_FILE = "best.pt"
 HEAD_MODEL_URL  = "https://raw.githubusercontent.com/Abcfsa/YOLOv8_head_detector/main/nano.pt"
 # More accurate (52 MB): .../main/medium.pt
 CONF = 0.15   # deliberately low, to see everything the model can find
