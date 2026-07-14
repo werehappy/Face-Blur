@@ -37,13 +37,24 @@ OUTPUT (into --out-dir, default paper_eval/)
     eval_comparison.tex    LaTeX (booktabs) recall matrix, ready to \input
     recall_by_domain.png   grouped bar chart: per-domain recall by model
 
-BASELINE NOTE
--------------
+GEOMETRIC BASELINE (COCO person -> estimated head)
+---------------------------------------------------
 A stock yolo11 outputs `person`, not heads, so ultralytics val cannot score it
-against head ground truth. To include the person->head geometric baseline (the
-pre-fine-tuning method), score it with the operating-point matcher in
-evaluate_heads.py and add its row to the CSV by hand, or ask to have that path
-merged in here.
+against head ground truth. This script therefore ships its own operating-point
+matcher and AP computation for that pathway: pass a COCO person model with
+--geom-model and each detected person box is converted to an estimated head
+box (top-center, sized from shoulder width -- Section 4.3 of the paper), then
+matched against the head labels at IoU 0.5. The row lands in the same CSV /
+Markdown / LaTeX / figure as the fine-tuned models.
+
+    python eval_compare.py --data head_dataset/data.yaml --split test ^
+        --model head_s:head_s.pt ^
+        --geom-model person2head_n:yolo11n.pt ^
+        --geom-w-frac 0.40 --geom-aspect 1.10
+
+Set --geom-w-frac / --geom-aspect to the SAME constants the application uses
+for its geometric fallback, otherwise you are evaluating a different baseline
+than the one the runtime policy disables.
 """
 
 import argparse
@@ -103,6 +114,199 @@ def parse_model(spec):
     if len(parts) < 2:
         raise argparse.ArgumentTypeError("model must be name:weights, got '{}'".format(spec))
     return parts[0], parts[1]
+
+
+# --------------------------------------------------------------------------- #
+# person->head geometric baseline (COCO person model -> estimated head boxes)
+# --------------------------------------------------------------------------- #
+def head_from_person(box, w_frac, aspect):
+    """Estimate a head box (xyxy) from a person box: top-center, head width =
+    w_frac * person-box width (shoulder width proxy), height = aspect * width.
+    Height is tied to the head's own width, not the person height, so partially
+    visible / truncated bodies do not produce absurdly tall head boxes."""
+    x1, y1, x2, _y2 = box
+    hw = (x2 - x1) * w_frac
+    hh = hw * aspect
+    cx = (x1 + x2) / 2.0
+    return (cx - hw / 2.0, y1, cx + hw / 2.0, y1 + hh)
+
+
+def load_gt_boxes(img_path, images_root, labels_root, shape):
+    """Read YOLO-format labels for one image, return pixel xyxy boxes."""
+    h, w = shape[0], shape[1]
+    rel = os.path.relpath(img_path, images_root)
+    stem = os.path.splitext(rel)[0]
+    lbl = os.path.join(labels_root, stem + ".txt")
+    out = []
+    if not os.path.exists(lbl):
+        return out
+    with open(lbl) as f:
+        for ln in f:
+            parts = ln.split()
+            if len(parts) < 5:
+                continue
+            _c, cx, cy, bw, bh = (float(v) for v in parts[:5])
+            out.append(((cx - bw / 2) * w, (cy - bh / 2) * h,
+                        (cx + bw / 2) * w, (cy + bh / 2) * h))
+    return out
+
+
+def iou_xyxy(a, b):
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    denom = area_a + area_b - inter
+    return inter / denom if denom > 0 else 0.0
+
+
+def match_image(preds, gts, iou_thr):
+    """Greedy conf-descending matching within one image.
+    preds: [(conf, xyxy)]. Returns [(conf, is_tp)] for every prediction."""
+    order = sorted(range(len(preds)), key=lambda i: -preds[i][0])
+    matched = [False] * len(gts)
+    out = []
+    for i in order:
+        conf, box = preds[i]
+        best, best_iou = -1, iou_thr
+        for g, gt in enumerate(gts):
+            if matched[g]:
+                continue
+            v = iou_xyxy(box, gt)
+            if v >= best_iou:
+                best, best_iou = g, v
+        if best >= 0:
+            matched[best] = True
+            out.append((conf, True))
+        else:
+            out.append((conf, False))
+    return out
+
+
+def op_metrics(preds_by_img, gts_by_img, keys, conf, iou_thr):
+    """Recall/Precision/F1 at an operating confidence over a subset of images."""
+    tp = fp = n_gt = 0
+    for k in keys:
+        gts = gts_by_img.get(k, [])
+        n_gt += len(gts)
+        preds = [p for p in preds_by_img.get(k, []) if p[0] >= conf]
+        for _c, is_tp in match_image(preds, gts, iou_thr):
+            if is_tp:
+                tp += 1
+            else:
+                fp += 1
+    recall = tp / n_gt if n_gt else float("nan")
+    precision = tp / (tp + fp) if (tp + fp) else float("nan")
+    f1 = (2 * precision * recall / (precision + recall)
+          if (precision == precision and recall == recall and (precision + recall)) else float("nan"))
+    return recall, precision, f1, n_gt
+
+
+def ap_at(preds_by_img, gts_by_img, keys, iou_thr):
+    """All-point-interpolated AP at one IoU threshold over a subset of images."""
+    scored = []
+    n_gt = 0
+    for k in keys:
+        gts = gts_by_img.get(k, [])
+        n_gt += len(gts)
+        scored.extend(match_image(preds_by_img.get(k, []), gts, iou_thr))
+    if n_gt == 0:
+        return float("nan")
+    if not scored:
+        return 0.0
+    scored.sort(key=lambda t: -t[0])
+    tp_cum = fp_cum = 0
+    rec, prec = [], []
+    for _conf, is_tp in scored:
+        if is_tp:
+            tp_cum += 1
+        else:
+            fp_cum += 1
+        rec.append(tp_cum / n_gt)
+        prec.append(tp_cum / (tp_cum + fp_cum))
+    # precision envelope (monotone non-increasing from the right)
+    for i in range(len(prec) - 2, -1, -1):
+        prec[i] = max(prec[i], prec[i + 1])
+    ap, prev_r = 0.0, 0.0
+    for r, p in zip(rec, prec):
+        ap += (r - prev_r) * p
+        prev_r = r
+    return ap
+
+
+def eval_geom_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows):
+    """Run each --geom-model once over all images, convert person boxes to head
+    estimates, then score every domain subset with the built-in matcher."""
+    from ultralytics import YOLO
+
+    # Confidence floor for the person model. We do NOT need the near-zero tail
+    # that object-detection mAP curves use: a person box below ~0.05 conf yields
+    # a garbage head estimate, and keeping hundreds of them per image (at conf
+    # 0.001) blows up both the preds dict and GPU memory. 0.05 keeps the PR
+    # curve meaningful while cutting the retained box count by 10-50x.
+    floor = args.conf if args.no_map else max(0.05, args.geom_conf_floor)
+
+    # Free CUDA between models/frames; harmless on CPU.
+    try:
+        import torch
+        _cuda = torch.cuda.is_available()
+    except Exception:
+        torch, _cuda = None, False
+
+    for name, weights in args.geom_models:
+        if not os.path.exists(weights):
+            print("[warn] skipping geom '{}': weights not found ({})".format(name, weights))
+            continue
+        print("\n=== geometric baseline: {} ({} person -> head, w_frac={}, aspect={}) ===".format(
+            name, weights, args.geom_w_frac, args.geom_aspect))
+        model = YOLO(weights)
+
+        preds_by_img, gts_by_img = {}, {}
+        # stream=True yields one Results at a time; batch=1 and per-frame cache
+        # clearing keep peak GPU memory to a single image regardless of test-set
+        # size. We copy out plain Python floats and never retain the Results.
+        stream = model.predict(imgs, stream=True, imgsz=args.imgsz, conf=floor,
+                               device=args.device, classes=[args.person_class],
+                               batch=1, verbose=False)
+        for img_path, res in zip(imgs, stream):
+            key = os.path.abspath(img_path)
+            boxes = res.boxes
+            preds = []
+            n = 0 if boxes is None else len(boxes)
+            if n:
+                # pull the whole tensor to CPU once, not element-by-element
+                confs = boxes.conf.detach().cpu().tolist()
+                xyxys = boxes.xyxy.detach().cpu().tolist()
+                for conf, pbox in zip(confs, xyxys):
+                    preds.append((float(conf),
+                                  head_from_person(tuple(pbox),
+                                                   args.geom_w_frac, args.geom_aspect)))
+            preds_by_img[key] = preds
+            gts_by_img[key] = load_gt_boxes(img_path, images_dir, labels_dir, res.orig_shape)
+            del res, boxes
+            if _cuda:
+                torch.cuda.empty_cache()
+
+        for dom, paths in eval_sets:
+            keys = [os.path.abspath(p) for p in paths]
+            recall, precision, f1, _ = op_metrics(preds_by_img, gts_by_img, keys,
+                                                  args.conf, args.geom_iou)
+            map50 = map5095 = float("nan")
+            if not args.no_map:
+                map50 = ap_at(preds_by_img, gts_by_img, keys, 0.5)
+                aps = [ap_at(preds_by_img, gts_by_img, keys, 0.5 + 0.05 * j) for j in range(10)]
+                aps = [a for a in aps if a == a]
+                map5095 = sum(aps) / len(aps) if aps else float("nan")
+            n_heads = heads[dom] if dom != "ALL" else sum(heads.values())
+            rows.append(dict(model=name, domain=dom, images=len(paths), heads=n_heads,
+                             recall=recall, precision=precision, f1=f1,
+                             map50=map50, map50_95=map5095))
+            print("  {:<12} R={} P={} F1={} mAP50={}".format(
+                dom, _fmt(recall), _fmt(precision), _fmt(f1), _fmt(map50)))
 
 
 # --------------------------------------------------------------------------- #
@@ -167,6 +371,8 @@ def collect_rows(args):
 
     tmpdir = tempfile.mkdtemp(prefix="evalcmp_")
     rows = []
+    eval_sets = [(d, buckets[d]) for d in ordered]
+    eval_sets.append(("ALL", imgs))
     for name, weights in args.models:
         if not os.path.exists(weights):
             print("[warn] skipping '{}': weights not found ({})".format(name, weights))
@@ -174,8 +380,6 @@ def collect_rows(args):
         print("\n=== model: {} ({}) ===".format(name, weights))
         model = YOLO(weights)
 
-        eval_sets = [(d, buckets[d]) for d in ordered]
-        eval_sets.append(("ALL", imgs))
         for dom, paths in eval_sets:
             list_txt = os.path.join(tmpdir, "imgs_{}_{}.txt".format(name, dom.strip("()")))
             with open(list_txt, "w") as f:
@@ -202,6 +406,9 @@ def collect_rows(args):
                              map50=map50, map50_95=map5095))
             print("  {:<12} R={} P={} F1={} mAP50={}".format(
                 dom, _fmt(recall), _fmt(precision), _fmt(f1), _fmt(map50)))
+
+    if args.geom_models:
+        eval_geom_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows)
     return rows, ordered
 
 
@@ -339,6 +546,24 @@ def main():
     ap.add_argument("--data", required=True, help="path to data.yaml")
     ap.add_argument("--model", action="append", dest="models", type=parse_model, default=[],
                     metavar="name:weights", help="repeatable; e.g. --model head_s:head_s.pt")
+    ap.add_argument("--geom-model", action="append", dest="geom_models", type=parse_model, default=[],
+                    metavar="name:weights",
+                    help="repeatable; COCO person model scored via the person->head "
+                         "geometric baseline, e.g. --geom-model person2head_n:yolo11n.pt")
+    ap.add_argument("--geom-w-frac", type=float, default=0.40,
+                    help="estimated head width as a fraction of the person-box width "
+                         "(default 0.40; match the app's fallback constant)")
+    ap.add_argument("--geom-aspect", type=float, default=1.10,
+                    help="estimated head height as a multiple of head width (default 1.10)")
+    ap.add_argument("--geom-iou", type=float, default=0.5,
+                    help="IoU match threshold for the geometric baseline (default 0.5, "
+                         "same as the ultralytics val default)")
+    ap.add_argument("--person-class", type=int, default=0,
+                    help="class index of 'person' in the geom model (COCO default 0)")
+    ap.add_argument("--geom-conf-floor", type=float, default=0.05,
+                    help="lowest person-detection confidence kept for the geometric "
+                         "baseline mAP curve (default 0.05; raise toward --conf if you "
+                         "hit GPU OOM on dense scenes, lower for a longer PR tail)")
     ap.add_argument("--split", default="test", help="split to evaluate (default test)")
     ap.add_argument("--imgsz", type=int, default=960, help="inference size (match the app, default 960)")
     ap.add_argument("--conf", type=float, default=0.25, help="operating-point confidence (default 0.25)")
@@ -352,9 +577,10 @@ def main():
                     help="figure title / table caption")
     args = ap.parse_args()
 
-    for req, msg in [(args.data, "--data"), (args.models, "at least one --model")]:
-        if not req:
-            ap.error("missing {}".format(msg))
+    if not args.data:
+        ap.error("missing --data")
+    if not (args.models or args.geom_models):
+        ap.error("need at least one --model or --geom-model")
     if not os.path.exists(args.data):
         sys.exit("[ERROR] data yaml not found: {}".format(args.data))
 

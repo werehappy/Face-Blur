@@ -43,7 +43,7 @@ Both are for the same goal — a `head.pt` for FACEBLUR — just different strat
 python train_all.py --data head_dataset/data.yaml
 ```
 
-That trains `yolo11n`, `yolo11s`, `yolo11m` in sequence at imgsz 960, copies each to `head_n.pt` / `head_s.pt` / `head_m.pt`, evaluates each, and writes `training_summary.txt` comparing them.
+That trains `yolo11n`, `yolo11s`, `yolo11m` in sequence at imgsz 960, copies each to `weights/head_n.pt` / `head_s.pt` / `head_m.pt` inside a timestamped run folder, evaluates each, and writes `training_summary.txt` comparing them.
 
 ### Flags
 
@@ -54,9 +54,24 @@ That trains `yolo11n`, `yolo11s`, `yolo11m` in sequence at imgsz 960, copies eac
 | `--imgsz` | `960` | Training size — **must match the app's `HEAD_INFER_IMGSZ`** |
 | `--epochs` | `300` | Epoch ceiling per model |
 | `--patience` | `60` | Early-stop after this many epochs with no val gain |
+| `--lr0` | `0.01` | Initial learning rate. **Lowered from the ultralytics `0.03` default** — fine-tuning from COCO weights at 0.03 is unstable and can crown a warmup-inflated epoch-1 checkpoint as `best.pt` (see the warning below). |
+| `--warmup-epochs` | `1.0` | LR warmup length. A long (3-epoch) warmup evaluates epoch 1 at a gentle LR and can make it look like the best epoch before real training starts. |
+| `--baseline-recall` | *(none)* | Recall of the model you currently ship (e.g. `0.737`). Any newly trained size that fails to beat it is flagged `REGRESSION — DO NOT SHIP` in the summary. |
 | `--batch` | `-1` | `-1` = auto-size to VRAM per model (recommended) |
 | `--device` | `0` | CUDA index, or `cpu` |
-| `--out` | `.` | Where to copy the renamed `head_<size>.pt` |
+| `--out` | `head_train_runs` | Root results folder; a timestamped subfolder is created inside it |
+| `--tag` | *(timestamp)* | Name for this run's subfolder (default `run_<timestamp>`) |
+
+> ### ⚠ A first-epoch `best.pt` means the learning rate was too high
+> Ultralytics picks `best.pt` by validation fitness (`0.1·mAP50 + 0.9·mAP50-95`).
+> When fine-tuning from COCO weights at a high LR, epoch 1 is evaluated during
+> warmup — before the high LR perturbs the weights — so it can look great, then
+> the run degrades and *never beats it*. You end up shipping a barely-trained
+> model. The lowered `--lr0 0.01` and `--warmup-epochs 1.0` defaults guard
+> against this. The script also **reads each run's `results.csv`, finds which
+> epoch won, and prints a `[WARN]`** (with a `!` on the `bestEp` column in the
+> summary) if `best.pt` came from epoch 1–2 of a longer run. If you see that,
+> lower `--lr0` further (try `0.005`) and retrain before trusting the checkpoint.
 
 ### Examples
 
@@ -66,13 +81,23 @@ python train_all.py --data head_dataset/data.yaml --models n s
 
 REM shorter runs that stop nearer the peak (see "Tips" — models overfit late)
 python train_all.py --data head_dataset/data.yaml --models n s --epochs 80 --patience 25
+
+REM verify the LR fix on nano first, guarding against a regression vs your shipped model
+python train_all.py --data head_dataset/data.yaml --models n ^
+    --lr0 0.01 --warmup-epochs 1.0 --baseline-recall 0.737 --epochs 60
 ```
 
 ### What you get
 
-- `head_n.pt`, `head_s.pt`, `head_m.pt` in `--out`
-- `training_summary.txt` — a recall/mAP comparison table
-- Per-model runs under `runs/detect/head_<size>/` (curves in `results.png`, weights in `weights/best.pt`)
+Everything for one run lands in a single timestamped folder,
+`head_train_runs/run_<timestamp>/` (or `head_train_runs/<tag>/` if you pass
+`--tag`):
+
+- `weights/head_n.pt`, `weights/head_s.pt`, `weights/head_m.pt` — the files you ship
+- `training_summary.txt` — a recall/mAP comparison table, now including a `bestEp`
+  column and any `REGRESSION` / warmup flags
+- `runs/head_<size>/` — Ultralytics training output (curves in `results.png`,
+  checkpoints in `weights/best.pt`, log in `results.csv`)
 
 **Robust for unattended runs:** if one size errors out, it logs the failure and continues to the next, so you still get the others.
 
@@ -147,11 +172,18 @@ python train_head.py --data head_dataset/data.yaml --model yolo11n.pt --final-im
 ## After training — deploy the model
 
 1. Pick the winner from `training_summary.txt` (or `head_final/best.pt`).
-2. **Confirm it's `best.pt`, not `last.pt`** — `best.pt` is saved at the peak epoch;
-   `last.pt` is the (often overfit) final epoch.
-3. Rename to `head_n.pt` / `head_s.pt` / `head_m.pt` (or `head.pt`) and place in the
+2. **Check the `bestEp` column has no `!`** and no `REGRESSION` flag — a `!` means
+   `best.pt` came from an early warmup epoch (retrain with a lower `--lr0`), and a
+   regression flag means the model scored below your shipped baseline (keep the old
+   model). Only ship a clean row.
+3. **Confirm it's `best.pt`, not `last.pt`** — `best.pt` is saved at the peak epoch;
+   `last.pt` is the (often overfit) final epoch. The shipped files under
+   `weights/head_<size>.pt` are already copied from each run's `best.pt`.
+4. Rename to `head_n.pt` / `head_s.pt` / `head_m.pt` (or `head.pt`) and place in the
    project root, then rebuild. The installer bundles them next to the exe.
-4. Set `HEAD_INFER_IMGSZ` in `face_blur.py` to the size you trained at (960).
+5. Set `HEAD_INFER_IMGSZ` in `face_blur.py` to the size you trained at (960), and
+   record the `--lr0` / `--warmup-epochs` you shipped with in the paper's training
+   configuration.
 
 ---
 
@@ -165,6 +197,11 @@ python train_head.py --data head_dataset/data.yaml --model yolo11n.pt --final-im
 - **Models peak early, then drift.** Val metrics often peak well before the epoch
   ceiling. `best.pt` captures the peak, but you can also stop sooner
   (`--patience 25`, `--epochs 60–80`) to save time.
+- **Watch the learning rate, not just the epochs.** If `best.pt` lands on epoch 1–2
+  (the `bestEp` column flags this), the LR was too high: the run peaked during
+  warmup and got worse after. Lower `--lr0` (0.01 → 0.005) rather than training
+  longer — more epochs won't fix an unstable LR. Sanity-check by watching
+  `val/cls_loss` in `results.csv`: a sharp spike right after warmup is the tell.
 - **The bottleneck is data, not model size or epochs.** If recall is low on a
   domain, add more (hard) labeled frames for that domain — you can't out-train a
   data limitation.

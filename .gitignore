@@ -58,6 +58,12 @@ YOLO_Head_FineTune/YoloLabel-Windows-x64/
 YOLO_Head_FineTune/dataset_labels/
 YOLO_Head_FineTune/head_dataset/
 YOLO_Head_FineTune/runs/
+YOLO_Head_FineTune/diag_out/
+YOLO_Head_FineTune/head_dataset_backup/
+YOLO_Head_FineTune/head_test/
+YOLO_Head_FineTune/Model_Compare/
+YOLO_Head_FineTune/head_train_runs/
+YOLO_Head_FineTune/paper_eval
 
 *.mp4
 *.zip

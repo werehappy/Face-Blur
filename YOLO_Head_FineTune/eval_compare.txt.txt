@@ -1,1 +1,10 @@
 python eval_compare.py --data head_test/data.yaml --split val --model head_s:head_s.pt
+
+python eval_compare.py --data head_test/data.yaml --split val --model head_n:head_n.pt --model head_s:head_s.pt --model head_n_old:runs/detect/head_n_v2-2/weights/best.pt
+
+python eval_compare.py --data head_test/data.yaml --split val --model head_n:head_n.pt --model head_s:head_s.pt --model head_m:head_m.pt  --geom-model person2head_n:yolo11n.pt
+
+python eval_compare.py --data head_test/data.yaml --split val --model head_n_old:weight0710/head_n.pt --model head_s_old:weight0710/head_s.pt --model head_m_old:weight/head_m.pt --model head_n:runs/detect/head_train_runs/run_20260713_151341/runs/head_n/weights/best.pt --model head_s:runs/detect/head_train_runs/run_20260713_151341/runs/head_s/weight/best.pt --model head_m:runs/detect/head_train_runs/run_20260713_151341/runs/head_m/weights/best.pt
+
+
+python eval_compare.py --data head_test/data.yaml --split val --model SCUT_HEAD_n:Model_Compare/YOLOv8_head_detector-main/nano.pt --model SCUT_HEAD_m:Model_Compare/YOLOv8_head_detector-main/medium.pt --geom-model person2head_n:yolo11n.pt --geom-model person2head_s:yolo11s.pt --geom-model person2head_m:yolo11m.pt
