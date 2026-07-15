@@ -1,31 +1,31 @@
-# FACEBLUR v1.3
-**Automated face censoring application**
+# FACEBLUR v1.4
+**Automated head & face censoring application**
 Made by werehappy
 
 ---
 
 ## Overview
 
-FACEBLUR is a desktop application that automatically detects and censors faces in video files using YOLOv11 face detection. It supports optional whole-head detection (catches the back and sides of the head, not just the face) powered by bundled, size-selectable fine-tuned head models, multiple censor styles, GPU acceleration, batch processing, and audio preservation.
+FACEBLUR is a desktop application that automatically detects and censors people's heads in video files. As of v1.4 the primary detector is a **fine-tuned head model** that fires on the head itself — front, back, side, helmeted, or motion-blurred — so coverage no longer depends on a face being visible. Three size-selectable head models ship with the app. Two optional aids (a person→head *rescue* prior and edge-strip inference) and an optional face safety net can each be switched on independently. It supports multiple censor styles, GPU acceleration, batch processing, and audio preservation.
 
 ---
 
 ## Features
 
 ### Detection
-- **YOLOv11 face detection** — nano / medium / large model options. The face pass always runs (even with whole-head detection on) and is unioned with the head pass.
-- **Whole-head detection** — optional pass that also censors heads the face model misses (backs/sides, partial heads, helmets, motion blur). It is powered by a **fine-tuned head model** that fires on the head itself, so it catches heads with no face or even no body visible. Three sizes ship with the app and are selectable in OPTIONS (see *Head model sizes*). Results are unioned with the face boxes, so it only adds coverage. Toggle via the **Detect whole head** checkbox in OPTIONS. See *Whole-Head Detection Setup* below.
-- **Head model sizes** — when whole-head mode is on, a **Head model size** selector (OPTIONS) chooses which bundled head detector runs: `head_n.pt` (nano, fastest), `head_s.pt` (small, balanced — default), or `head_m.pt` (medium, most accurate, slower). All three are fine-tuned on the same data; pick by the speed-vs-accuracy trade for your hardware (medium is heavy on CPU). The choice persists across sessions.
-- **Person→head fallback** — a COCO person detector can estimate a head *region* from each body (robust to blur/partial bodies). This is now a **fallback used only when no fine-tuned head model is loaded**. When a head model *is* loaded it becomes the primary detector and the person→head geometry pass is **disabled** — that estimate could land on forward-held gear (e.g. weapon illuminators) and paint a false censor, so demoting it removes those false positives. Policy is tunable via `PERSON_HEAD_MODE` in `face_blur.py`.
-- **No double-masking** — when whole-head mode is on, a face that's already covered by a head box is not censored a second time. The face box is only kept (and grown to head size) for heads the head pass genuinely missed, so each head gets exactly one censor region instead of an overlapping pair.
-- **Matched inference size** — the head model runs at a fixed inference size (`HEAD_INFER_IMGSZ`, default **960**) that must equal the size it was trained at. A train/inference size mismatch was the cause of scale-dependent false positives (objects misread as heads at the wrong scale); keeping them matched fixes it.
-- **Edge strip detection** — additional YOLO pass on frame borders to catch partially out-of-frame faces
+- **Head detection (primary)** — a **fine-tuned head model** is the main and, by default, only detector. It fires on the head itself, so it catches backs, sides, partial heads, helmets, and motion-blurred heads, and works even when no face or no body is visible. Three sizes ship with the app and are selectable in OPTIONS (see *Head model sizes*). On by default.
+- **Head model sizes** — a **Head model size** selector (OPTIONS) chooses which bundled detector runs: `head_n.pt` (nano, fastest), `head_s.pt` (small, balanced — default), or `head_m.pt` (medium, most accurate, slower). All three are fine-tuned on the same data; pick by the speed-vs-accuracy trade for your hardware (medium is heavy on CPU). The choice persists across sessions.
+- **Person→head aid (rescue)** — *optional, off by default.* A COCO person detector estimates a head *region* from each body and uses those regions as a **soft spatial prior** that rescues weak head detections: the head model is run at a low candidate floor, and a low-confidence head box that overlaps a person-derived region is boosted past the operating point, while an isolated low-confidence box is not. Crucially, the person→head regions are **not** added as boxes themselves, so a mislocalized estimate (e.g. on forward-held gear) can no longer paint a censor on its own. In testing this raised recall by up to ~3 points at a small precision cost. Toggle via **Person→head aid (rescue)** in OPTIONS.
+- **Edge strip detection** — *optional, off by default.* Runs the head model over the four frame borders at full resolution to recover heads cut off at the edge of frame. Toggle via **Edge strip detection** in OPTIONS.
+- **Face safety net** — *optional, off by default.* Runs a YOLOv11 face model and keeps a face box (grown to head size) only where no head box already covers it, so it fills genuine head-model misses without double-masking. Toggle via **Face safety net** in OPTIONS.
+- **No double-masking** — a face or region that's already covered by a head box is not censored a second time; each head gets exactly one censor region.
+- **Matched inference size** — the head model runs at a fixed inference size (`HEAD_INFER_IMGSZ`, default **960**) that must equal the size it was trained at. A train/inference size mismatch was the cause of scale-dependent false positives; keeping them matched fixes it.
 - **Face tracking (CSRT)** — smooth box interpolation between detection frames, eliminates flickering
-- **Motion-aware box smoothing** — detections become tracks that follow **camera motion** (global frame-to-frame shift estimated by phase correlation, ~4 ms/frame) and their own velocity, so held boxes stay glued to the head during fast pans instead of drifting onto walls. Position jitter is damped, but large real movement snaps instantly (no lag). Hold time is **graduated by evidence**: a 1-frame false positive disappears after ~3 frames, while a repeatedly-detected head earns up to 8 frames of blind coverage — detections every 2nd–3rd frame produce continuous, flicker-free cover. Toggle via **Smooth boxes (anti-flicker)** in OPTIONS (default ON)
-- **Per-source debug** — with **Show debug boxes** + whole-head mode on, thin outlines show which detector found each head: cyan = face model, red = the fine-tuned head model, yellow = person→head region (only appears when no head model is loaded, since the person→head pass is otherwise disabled); the log prints per-source counts per file
+- **Motion-aware box smoothing** — detections become tracks that follow **camera motion** (global frame-to-frame shift estimated by phase correlation, ~4 ms/frame) and their own velocity, so held boxes stay glued to the head during fast pans instead of drifting onto walls. Position jitter is damped, but large real movement snaps instantly (no lag). Hold time is **graduated by evidence**: a 1-frame false positive disappears after ~3 frames, while a repeatedly-detected head earns up to 8 frames of blind coverage. Toggle via **Smooth boxes (anti-flicker)** in OPTIONS (default ON)
+- **Per-source debug** — with **Show debug boxes** on, thin outlines show which source produced each box: red = head model, yellow = person→head rescue region (when the aid is on), cyan = face safety net (when on); the log prints per-source counts per file
 - **Confidence heatmap** — blur intensity scales with detection confidence
-- **Downscale detection** — runs detection on reduced resolution for speed, scales boxes back up
-- **Frame skipping** — runs YOLO every N frames, uses tracker between detections
+- **Downscale detection** — the face safety net can run on reduced resolution for speed; the head pass always runs at full resolution
+- **Frame skipping** — runs detection every N frames, uses tracker between detections
 
 ### Censor Modes
 - **Blur** — Gaussian blur (kernel size adjustable)
@@ -46,7 +46,7 @@ FACEBLUR is a desktop application that automatically detects and censors faces i
 - **Collapsible sections** — PARAMETERS / OPTIONS / PERFORMANCE collapse to save space
 - **Video thumbnail preview** — shows frame from selected file
 - **First frame preview** — runs detection on frame 1 before processing starts
-- **Head model size selector** — nano / small / medium dropdown in OPTIONS for the whole-head detector (active when Detect whole head is on)
+- **Head model size selector** — nano / small / medium dropdown in OPTIONS for the head detector
 - **Drag and drop** — drag video files directly onto the file list
 - **Settings persistence** — all settings saved on close, restored on next launch
 - **Window position memory** — remembers size and position between sessions
@@ -91,10 +91,12 @@ FACEBLUR is a desktop application that automatically detects and censors faces i
 | Blur kernel | 51 | Strong enough to be unrecognizable |
 | Pixel size | 15 | Clear pixelation effect |
 | Frame skip | 2 | 2x faster, barely noticeable |
-| Detect scale | 0.50 | 2x faster detection, minimal accuracy loss |
-| Edge strip | ON | Catches partial/out-of-frame faces |
-| Detect whole head | OFF | Turn ON to also censor backs/sides of heads (slower) |
-| Head model size | small | nano = fastest, medium = most accurate/slowest (used when Detect whole head is on) |
+| Detect scale | 0.50 | Speeds up the optional face net; head pass is always full-res |
+| Head detection | ON | Primary detector (default) |
+| Head model size | small | nano = fastest, medium = most accurate/slowest |
+| Person→head aid | OFF | Turn ON to rescue weak head detections (recall boost, small precision cost) |
+| Edge strip | OFF | Turn ON to catch heads cut off at frame borders |
+| Face safety net | OFF | Turn ON to also cover heads the head model misses via a face model |
 | Debug boxes | OFF | Clean output for production |
 | Smooth boxes | ON | Anti-flicker: smooths box motion and holds boxes through missed detections |
 
@@ -183,7 +185,7 @@ Notes:
 
 | Package | Purpose |
 |---|---|
-| `ultralytics` | YOLOv11 face detection; bundled fine-tuned head models (`head_n/s/m.pt`) for whole-head mode; COCO `yolo11n` person detector as the person→head fallback |
+| `ultralytics` | YOLOv11 head detection (bundled fine-tuned `head_n/s/m.pt`, primary); COCO `yolo11n` person detector for the optional person→head rescue aid; YOLOv11 face model for the optional face safety net |
 | `opencv-contrib-python` | Video I/O, frame processing, CSRT tracking (contrib build required for `cv2.legacy` trackers) |
 | `torch` | Neural network inference (CPU or CUDA) — downloaded on first run, not bundled |
 | `numpy` | Array operations — **pin `numpy<2`** for binary compatibility with opencv/torch |
@@ -210,32 +212,37 @@ If the GPU version is installed but CUDA is unavailable at runtime, the app disp
 
 ---
 
-## Whole-Head Detection Setup
+## Head Detection Setup
 
-The **Detect whole head** option (OPTIONS section) runs a dedicated head model
-alongside the face model and merges the results. Unlike a face model, a head
-model fires on the head itself — so it catches the back and sides of a head, and
-works even when only the head/shoulders (or nothing but the head) are in frame.
+Head detection is the app's **primary method** and is on by default. A dedicated
+head model fires on the head itself — so it catches the back and sides of a
+head, and works even when only the head/shoulders (or nothing but the head) are
+in frame. Three optional aids can each be switched on independently in OPTIONS.
 
-**How whole-head detection works (current behavior):**
+**How detection works (v1.4):**
 
 1. **Fine-tuned head model (primary).** FACEBLUR ships three fine-tuned head
    detectors and you pick one with the **Head model size** selector:
    `head_n.pt` (nano), `head_s.pt` (small, default), `head_m.pt` (medium). The
-   chosen model runs at full resolution with edge strips, at a fixed inference
-   size (`HEAD_INFER_IMGSZ`, default 960) that matches how the models were
-   trained. Its boxes are unioned with the face boxes.
-2. **Person→head region (fallback only).** A COCO person detector (`yolo11n`,
-   auto-downloaded) can estimate a head region from each body (top-center, sized
-   by shoulder width). This runs **only when no fine-tuned head model is
-   loaded** — it is a fallback for installs without the head models. When a head
-   model is present it is disabled, because the geometry estimate could land on
-   forward-held gear (e.g. a weapon illuminator) and create a false censor.
-
-A face box that already falls inside a head box is dropped rather than censored
-twice, so heads get a single clean censor region. The `PERSON_HEAD_MODE` constant
-in `face_blur.py` controls the fallback policy (`"user_off"` default — off when a
-head model is loaded; `"any_off"`, `"always"`, `"never"`).
+   chosen model runs at full resolution at a fixed inference size
+   (`HEAD_INFER_IMGSZ`, default 960) that matches how the models were trained.
+   This is the only detector that runs unless you enable an aid.
+2. **Person→head aid — rescue (optional).** A COCO person detector (`yolo11n`,
+   auto-downloaded) estimates a head region from each body (top-center, sized by
+   shoulder width). These regions are used as a **soft prior**: the head model
+   is run at a low candidate floor, and a weak head detection that overlaps a
+   region is boosted past the operating point (`conf × (1 + overlap)`), while an
+   isolated weak detection is discarded. The regions are **never added as boxes
+   themselves**, so a region that lands on forward-held gear (e.g. a weapon
+   illuminator) cannot create a censor on its own — it can only reinforce a real
+   but low-confidence head detection. This recovers hard heads (blurred,
+   helmeted, partial) at a modest precision cost.
+3. **Edge strips (optional).** The head model additionally runs over the four
+   frame borders at full resolution, recovering heads truncated at the edge.
+4. **Face safety net (optional).** A face model runs and its boxes are kept
+   (grown to head size) only where no head box already covers them, filling
+   genuine head-model misses. A face already inside a head box is dropped rather
+   than censored twice.
 
 > **Important: inference size must match training size.** The head models are
 > trained at 960 and the app runs them at `HEAD_INFER_IMGSZ = 960`. If you
@@ -253,15 +260,18 @@ footage (e.g. CQB/body-cam, or dense crowds) benefits from:
 | Detect scale | 1.00 | Full resolution; blurry/partial heads need every pixel |
 | Confidence | ~0.25 or lower | For privacy, over-cover; recall matters more than precision |
 | Padding | 0.30+ | Extra padding guarantees coverage around the detected head |
+| Person→head aid | ON | Rescues weak head detections on blurred/partial heads |
+| Edge strip | ON | If heads are frequently cut off at frame borders |
 | Head model size | small or medium | Larger = better on crowded/occluded heads, slower |
 
-The head pass also runs at a lower confidence floor than the face pass
-automatically (`HEAD_CONF_DROP`, default 0.15).
+The head pass also runs at a lower confidence floor than the face net
+automatically (`HEAD_CONF_DROP`, default 0.15); when the person→head aid is on,
+candidates are collected down to a rescue floor (`PRIOR_RESCUE_FLOOR`, 0.10).
 
-**Verifying it works.** With **Detect whole head** on, the log names the head
-model in use (e.g. `Head model: using head_s.pt`) and notes when the person→head
-pass is disabled. Turn on **Show debug boxes** to see what each source adds
-(red = head model, cyan = face, yellow = person→head fallback when active).
+**Verifying it works.** The log names the head model in use (e.g. `Head model:
+using head_s.pt`) and reports which aids are active. Turn on **Show debug boxes**
+to see what each source adds (red = head model, yellow = person→head rescue
+region when the aid is on, cyan = face safety net when on).
 
 **Training your own head models.** No public model is trained on helmeted /
 blurred / tactical or dense-crowd heads — the only reliable fix is fine-tuning on
@@ -303,7 +313,8 @@ pooled score hides one domain underperforming behind another.
 | v1.2 | 2026 | **Bundled a fine-tuned `head.pt`.** A dedicated head detector was trained on custom footage and now ships with the app, so whole-head mode catches backs/sides/partial heads out of the box instead of relying on the person→head-region estimate alone. The model was produced by **labeling a few hundred frames** from real target clips (the helmeted / motion-blurred / cut-off heads no public model covers) and **fine-tuning YOLO** on them — labeling is the bulk of the work; the training itself is a few lines (see *Whole-Head Detection Setup → Best results on out-of-distribution footage: fine-tune*). Build scripts (`build.bat`, `build_installer.bat`, `installer.iss`) now install `head.pt` next to the exe, where a user-supplied `head.pt` still overrides it. Recommended for hard footage: Frame skip 1, Detect scale 1.00, Confidence ~0.25, Padding 0.30+. |
 | v1.2.1 | 2026 | **Fixed flaky / slow first launch.** The splash screen could intermittently hang on startup — requiring several reopens, or taking so long the user gave up — because the background loader updated the splash from a worker thread. Tkinter is single-threaded, so the cross-thread widget calls (and `update()`) raced the main `mainloop()` and occasionally deadlocked the window or left the Tcl interpreter in a bad state, most often during the one-time torch download on first run. `set_status` now marshals all splash updates onto the Tk thread via `after()` instead of touching widgets directly. The genuine first-run torch download still takes a few minutes, but the splash stays responsive and launches are now reliable. |
 | v1.3 | 2026 | **Size-selectable fine-tuned head models + smarter whole-head detection.** Ships three fine-tuned head detectors (`head_n.pt` / `head_s.pt` / `head_m.pt`), selectable by size in OPTIONS (nano/small/medium — speed vs accuracy). When a fine-tuned head model is loaded it is now the **primary** head detector and the person→head-region geometry pass is **disabled** — that estimate was firing on forward-held gear (e.g. weapon illuminators), so demoting it removes those false positives; the person→head pass remains only as a fallback when no head model is present (tunable via `PERSON_HEAD_MODE`). The head model now runs at a fixed inference size (`HEAD_INFER_IMGSZ`, 960) that **must match its training size**, fixing scale-mismatch false positives. New training pipeline and helper scripts (`sample_frames.py` folder support, `check_split.py`, `fix_split.py`, `diagnose_heads.py`, `train_head.py`, `train_all.py`) plus an updated `HEAD_MODEL_PIPELINE` doc cover labeling, clip-level splitting, per-domain balance, and training all three sizes at once. The first-run splash now shows a moving busy bar with an elapsed clock during the one-time torch download (the GPU build is ~2.5GB) so it is clearly alive. Build scripts and the installer now bundle all three head models next to the exe. |
+| v1.4 | 2026 | **Head detection is now the primary method, with independent opt-in aids.** The fine-tuned head model is the main and, by default, only detector; the face model is no longer always on. Three aids can each be toggled independently in OPTIONS, all **off by default**: (1) a **person→head rescue aid** that uses person-derived head regions as a *soft prior* to boost weak-but-overlapping head detections past the operating point — regions are never added as standalone boxes, so misplaced estimates on forward-held gear can no longer create a censor by themselves (this replaces the old all-or-nothing person→head union/disable policy and, in measured evaluation, recovered most of the recall of the raw union while giving back most of its precision cost); (2) **edge-strip inference** over the four frame borders; and (3) a **face safety net** that fills genuine head-model misses without double-masking. The old "Detect whole head" checkbox and the `PERSON_HEAD_MODE` auto-policy are retired in favor of the explicit toggles. All settings persist across sessions. |
 
 ---
 
-*FACEBLUR v1.3 — made by werehappy*
+*FACEBLUR v1.4 — made by werehappy*

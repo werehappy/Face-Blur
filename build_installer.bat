@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 echo.
 echo ==================================================
-echo   FACEBLUR v1.3  --  Build Installer (small / no torch bundled)
+echo   FACEBLUR v1.4  --  Build Installer (small / no torch bundled)
 echo ==================================================
 echo.
 

@@ -64,6 +64,7 @@ YOLO_Head_FineTune/head_test/
 YOLO_Head_FineTune/Model_Compare/
 YOLO_Head_FineTune/head_train_runs/
 YOLO_Head_FineTune/paper_eval
+YOLO_Head_FineTune/bench/
 
 *.mp4
 *.zip

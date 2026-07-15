@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 # Version
-VERSION = "1.3"
+VERSION = "1.4"
 
 # Settings persistence
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".faceblur_settings.json")
@@ -372,14 +372,14 @@ def get_detector(model_key, log_fn=None):
     return get_detector_by_file(filename, url, log_fn)
 
 def get_head_detector(head_size=None, log_fn=None):
-    """Load the whole-head detectors. Returns (head_model, person_model).
-    BOTH are loaded and used together (union of their boxes):
-      head_model   -- head.pt next to the app (direct head boxes; catches heads
-                      with no body in frame). None if absent/broken.
-      person_model -- COCO person detector -> head region (robust to blur,
-                      helmets, partial bodies). None if it cannot load.
+    """Load the head detector and the auxiliary person detector.
+      head_model   -- the fine-tuned head model (head_n/s/m.pt) or a legacy
+                      head.pt; auto-downloaded default if none present. This is
+                      the primary detector.
+      person_model -- COCO person detector, used only when the person->head aid
+                      is enabled (as a rescue prior, not a box source).
+    Returns (head_model, person_model, head_is_user).
     """
-def get_head_detector(head_size=None, log_fn=None):
     head_model = None
     head_is_user = False
     # 1) The selected fine-tuned size model (head_n/s/m.pt) first, then a legacy
@@ -793,6 +793,58 @@ def _person_to_head(boxes):
         out.append((cx - hw, top, cx + hw, top + hh, s))
     return out
 
+# Prior-guided re-scoring ("rescue") parameters. The person->head pathway is
+# used here NOT as a box source but as a soft spatial prior over the head
+# model's own detections: a weak head box that overlaps a person-derived head
+# region is boosted past the operating point, while an isolated weak box is
+# not. This is the configuration the paper's ablation recommends (rescue only,
+# no raw geometry-box injection), which recovered ~95% of the recall gain of
+# the raw union while giving back most of its precision cost.
+PRIOR_RESCUE_FLOOR = 0.10   # candidate floor for the head model when rescuing
+PRIOR_RESCUE_ALPHA = 1.0    # boost strength: conf *= (1 + ALPHA * overlap)
+PRIOR_RESCUE_OVERLAP = 0.30 # IoU (or center-inside) needed to count as "inside"
+
+def _box_iou(a, b):
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    ua = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
+    return inter / ua if ua > 0 else 0.0
+
+def _prior_overlap(box, priors):
+    """Max IoU of `box` against the person-derived head regions, with a floor
+    of 0.5 when the box CENTER falls inside a prior (the prior is a coarse
+    region, so IoU alone under-credits a correct-but-small head)."""
+    best = 0.0
+    cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+    for pb in priors:
+        v = _box_iou(box, pb)
+        if pb[0] <= cx <= pb[2] and pb[1] <= cy <= pb[3]:
+            v = max(v, 0.5)
+        if v > best:
+            best = v
+    return best
+
+def _rescore_with_prior(head_boxes, prior_regions, op_conf):
+    """Prior-guided rescue. head_boxes: (x1,y1,x2,y2,score) collected at the low
+    PRIOR_RESCUE_FLOOR. prior_regions: (x1,y1,x2,y2[,score]) head regions from
+    _person_to_head. Returns the boxes whose BOOSTED score clears op_conf, with
+    the boosted score attached. No raw prior boxes are ever added (rescue only),
+    so gear-forward misplaced regions cannot paint a censor on their own."""
+    priors = [tuple(p[:4]) for p in prior_regions]
+    out = []
+    for b in head_boxes:
+        x1, y1, x2, y2 = b[:4]
+        s = b[4] if len(b) > 4 else 1.0
+        ov = _prior_overlap((x1, y1, x2, y2), priors) if priors else 0.0
+        s2 = min(1.0, s * (1.0 + PRIOR_RESCUE_ALPHA * ov))
+        if s2 >= op_conf:
+            out.append((x1, y1, x2, y2, s2))
+    return out
+
 def _face_to_head(boxes):
     """Grow a FACE box outward into a whole-HEAD box: faces sit in the lower-
     centre of the head, so the head extends sideways (ears) and upward (crown),
@@ -843,7 +895,11 @@ def _merge_face_head(face_boxes, head_boxes):
     return _dedup_boxes(merged)
 
 def _person_head_active(head_model, head_is_user):
-    """Whether the person->head GEOMETRY pass should contribute boxes, per
+    """DEPRECATED / UNUSED. The person->head pathway is now controlled by the
+    explicit "Person->head aid" GUI toggle (use_person_aid), not by the
+    automatic PERSON_HEAD_MODE policy. Kept for backward reference only.
+
+    Whether the person->head GEOMETRY pass should contribute boxes, per
     PERSON_HEAD_MODE. The pass estimates a head from a body box and can land on
     forward-held gear/weapons, so it is demoted once a real head model is doing
     the work. See PERSON_HEAD_MODE for the policy options."""
@@ -859,70 +915,90 @@ def _person_head_active(head_model, head_is_user):
 
 
 def detect_objects(frame, face_detector, head_model, person_model, confidence,
-                   detect_scale=0.5, edge_strip=True, detect_head=False,
-                   head_is_user=False):
-    """Detect faces, and optionally whole heads, then merge (union).
+                   detect_scale=0.5, edge_strip=False, detect_head=True,
+                   head_is_user=False, use_face=False, use_person_aid=False):
+    """Head-primary detection with independent, opt-in aids.
 
-    Whole-head mode runs UP TO TWO extra passes and unions everything:
-      person_model : person box -> estimated head region. Covers side faces,
-                     1/4-cut faces and blurred heads -- anyone with some torso
-                     visible.
-      head_model   : direct head boxes (head.pt). Covers heads with NO body in
-                     frame, the case the person method cannot reach. Runs at
-                     FULL resolution with edge strips, because such heads are
-                     small/partial and downscaling makes them invisible.
+    Primary pass:
+      head_model : direct head boxes (the fine-tuned head.pt) at full
+                   resolution and HEAD_INFER_IMGSZ. This is the main and, by
+                   default, only detector.
+
+    Optional aids (each independently toggleable):
+      use_person_aid : run the COCO person detector, convert each person box to
+                       an estimated head region, and use those regions as a SOFT
+                       PRIOR that rescues weak head detections (see
+                       _rescore_with_prior). Not a box source -- an isolated
+                       mislocalized region cannot create a censor on its own.
+      edge_strip     : run the head model over the four frame-edge strips too,
+                       recovering heads cut off at the boundary.
+      use_face       : run the face model as a safety net; a face box is kept
+                       (grown to head size) only where no head box already
+                       covers it, so it fills genuine head-model misses.
+
     Returns list of (x1, y1, x2, y2, score).
 
-    Side effect: fills LAST_DETECT_BREAKDOWN with the raw per-source boxes
-    {'face': [...], 'person': [...], 'head': [...]} so the caller can show
-    color-coded debug boxes / per-pass counts (is each pass contributing?)."""
+    Side effect: fills LAST_DETECT_BREAKDOWN with per-source boxes for the debug
+    overlay: {'face': [...], 'person': [...], 'head': [...]}.
+    """
     global LAST_DETECT_BREAKDOWN
-    face_boxes = detect_faces(frame, face_detector, confidence, detect_scale, edge_strip)
-    LAST_DETECT_BREAKDOWN = {"face": list(face_boxes), "person": [], "head": []}
-    if not detect_head:
-        return face_boxes
-    if head_model is None and person_model is None:
-        # Whole-head requested but no head/person model loaded: still grow the
-        # face boxes to head size so ears/crown get covered (best effort).
-        return _dedup_boxes(_face_to_head(face_boxes))
-    # Backs/sides of heads score lower than faces -> use a lower floor here.
-    head_conf = max(0.15, confidence - HEAD_CONF_DROP)
-    extra = []
-    if person_model is not None and _person_head_active(head_model, head_is_user):
+    LAST_DETECT_BREAKDOWN = {"face": [], "person": [], "head": []}
+
+    # Backwards-compatible fallback: if head is not the active method and no head
+    # model is available, degrade to the legacy face-only behavior so nothing
+    # silently returns nothing.
+    if not detect_head or head_model is None:
+        if use_face and face_detector is not None:
+            face_boxes = detect_faces(frame, face_detector, confidence,
+                                      detect_scale, edge_strip)
+            LAST_DETECT_BREAKDOWN["face"] = list(face_boxes)
+            return _dedup_boxes(_face_to_head(face_boxes))
+        # No head model and face off: nothing to do.
+        return []
+
+    # --- primary head pass -------------------------------------------------
+    head_classes = _head_class_ids(head_model)
+    # When the person aid is on we collect at a LOW floor so weak-but-real heads
+    # survive to be rescued; otherwise we collect at the operating confidence.
+    # Heads (backs/partials) score lower than faces, so the base floor already
+    # sits below the face operating point.
+    base_conf = max(0.15, confidence - HEAD_CONF_DROP)
+    collect_conf = min(base_conf, PRIOR_RESCUE_FLOOR) if use_person_aid else base_conf
+    # edge_conf_drop=0.0: head_conf is already lowered; a second drop on the
+    # full-res strips was a false-positive factory (kept from the original).
+    model_heads = detect_faces(frame, head_model, collect_conf, 1.0,
+                               edge_strip, classes=head_classes,
+                               edge_conf_drop=0.0, imgsz=HEAD_INFER_IMGSZ)
+
+    # --- optional person->head prior (rescue) ------------------------------
+    if use_person_aid and person_model is not None:
         # Full resolution regardless of the Detect-scale slider: small/partial/
-        # side-on bodies vanish at 0.5x and the person pass then finds nothing,
-        # which is a common reason whole-head mode "did nothing". Person boxes are
-        # large, so full-res here is cheap relative to the recall it buys.
-        person_raw = detect_faces(frame, person_model, head_conf, 1.0,
+        # side-on bodies vanish at 0.5x. Person boxes are large, so full-res is
+        # cheap for the recall it buys.
+        person_raw = detect_faces(frame, person_model, base_conf, 1.0,
                                   edge_strip=False, classes=[HEAD_PERSON_CLASS])
-        person_heads = _person_to_head(person_raw)
-        LAST_DETECT_BREAKDOWN["person"] = list(person_heads)
-        extra.extend(person_heads)
-    if head_model is not None:
-        head_classes = _head_class_ids(head_model)
-        # head_conf is already lowered by HEAD_CONF_DROP; do NOT drop it
-        # again on the edge strips (full-res strips at ~0.10 conf were a
-        # false-positive factory).
-        model_heads = detect_faces(frame, head_model, head_conf, 1.0,
-                                   edge_strip, classes=head_classes,
-                                   edge_conf_drop=0.0, imgsz=HEAD_INFER_IMGSZ)
-        LAST_DETECT_BREAKDOWN["head"] = list(model_heads)
-        extra.extend(model_heads)
-    # Drop face boxes that a head/person box already covers BEFORE growing them,
-    # so one head never gets a face censor AND a head censor stacked on top of
-    # each other (the double-masking bug). The test runs on the RAW face box: it
-    # is small and sits well inside the head region, so containment catches it.
-    # If we grew the face first (old behavior), the enlarged, upward-shifted box
-    # was no longer contained, the test failed, and both censors survived.
-    #
-    # Faces that survive are heads the head/person passes genuinely MISSED; only
-    # those are grown to head size, so the face model still acts as a safety net.
-    # Debug breakdown keeps the RAW face boxes; only the censored union grows them.
-    head_union = _dedup_boxes(extra)
-    uncovered_faces = [fb for fb in face_boxes
-                       if not any(_contained(fb, hb, FACE_COVERED_FRAC)
-                                  for hb in head_union)]
-    return _dedup_boxes(list(head_union) + _face_to_head(uncovered_faces))
+        prior_regions = _person_to_head(person_raw)
+        LAST_DETECT_BREAKDOWN["person"] = list(prior_regions)
+        model_heads = _rescore_with_prior(model_heads, prior_regions, base_conf)
+    else:
+        # No aid: enforce the normal operating floor on the collected heads.
+        model_heads = [b for b in model_heads
+                       if (b[4] if len(b) > 4 else 1.0) >= base_conf]
+
+    LAST_DETECT_BREAKDOWN["head"] = list(model_heads)
+    head_union = _dedup_boxes(model_heads)
+
+    # --- optional face safety net ------------------------------------------
+    if use_face and face_detector is not None:
+        face_boxes = detect_faces(frame, face_detector, confidence,
+                                  detect_scale, edge_strip)
+        LAST_DETECT_BREAKDOWN["face"] = list(face_boxes)
+        uncovered_faces = [fb for fb in face_boxes
+                           if not any(_contained(fb, hb, FACE_COVERED_FRAC)
+                                      for hb in head_union)]
+        return _dedup_boxes(list(head_union) + _face_to_head(uncovered_faces))
+
+    return head_union
 
 # Per-source boxes of the most recent detect_objects call (for debug overlay).
 LAST_DETECT_BREAKDOWN = {"face": [], "person": [], "head": []}
@@ -1146,7 +1222,7 @@ FV = ("Courier New", 11, "bold")
 class App(tk.Tk):
     def __init__(self, gpu_info=None):
         super().__init__()
-        self.title("FACEBLUR v1.3")
+        self.title("FACEBLUR v1.4")
         self.configure(bg=BG)
         self.geometry("960x780")
         self.minsize(900, 700)
@@ -1171,8 +1247,10 @@ class App(tk.Tk):
         self._detect_scale = tk.DoubleVar(self, value=0.50)
         self._gpu_info     = gpu_info if gpu_info is not None else detect_gpu()
         self._suffix       = tk.StringVar(self, value="_blurred")
-        self._edge_strip   = tk.BooleanVar(self, value=True)
-        self._detect_head  = tk.BooleanVar(self, value=False)
+        self._edge_strip   = tk.BooleanVar(self, value=False)
+        self._detect_head  = tk.BooleanVar(self, value=True)
+        self._use_face     = tk.BooleanVar(self, value=False)
+        self._use_person_aid = tk.BooleanVar(self, value=False)
         self._head_size    = tk.StringVar(self, value=HEAD_MODEL_DEFAULT_KEY)
         self._smooth_boxes = tk.BooleanVar(self, value=True)
         self._export_report = tk.BooleanVar(self, value=False)
@@ -1186,8 +1264,8 @@ class App(tk.Tk):
         top = tk.Frame(self, bg=BG)
         top.pack(fill="x", padx=20, pady=(16, 0))
         tk.Label(top, text="FACEBLUR", bg=BG, fg=ACCENT, font=FH).pack(side="left")
-        tk.Label(top, text="YOLOv11 face censoring", bg=BG, fg=TDIM, font=FS).pack(side="left", padx=12)
-        tk.Label(top, text="v1.3", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left")
+        tk.Label(top, text="YOLOv11 head & face censoring", bg=BG, fg=TDIM, font=FS).pack(side="left", padx=12)
+        tk.Label(top, text="v1.4", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left")
         tk.Label(top, text="made by werehappy", bg=BG, fg=TDIM, font=("Courier New", 8)).pack(side="left", padx=4)
         # GPU/CPU indicator (right side of top bar)
         if self._gpu_info["torch_cuda"]:
@@ -1313,23 +1391,24 @@ class App(tk.Tk):
         self._mode_btns = mr.winfo_children()
         self._refresh_mode_btns()
 
-        # model
-        self._section(right, "YOLO MODEL")
-        mkr = tk.Frame(right, bg=BG2)
-        mkr.pack(fill="x", padx=8, pady=(0, 4))
-        for k in YOLO_MODELS.keys():
-            btn = tk.Label(mkr, text=k, font=FL, padx=10, pady=4,
+        # head model (PRIMARY detector) — button row like the old model picker
+        self._section(right, "HEAD MODEL")
+        hkr = tk.Frame(right, bg=BG2)
+        hkr.pack(fill="x", padx=8, pady=(0, 4))
+        for k in HEAD_MODELS.keys():
+            btn = tk.Label(hkr, text=k, font=FL, padx=10, pady=4,
                            cursor="hand2", relief="flat")
             btn.pack(side="left", padx=(0, 2))
             btn.bind("<Button-1>", lambda e, v=k: (
-                self._model_key.set(v), self._refresh_model_btns()))
+                self._head_size.set(v), self._refresh_head_btns()))
             btn.bind("<Enter>", lambda e, b=btn: b.config(
                 bg="#505050" if b["bg"] != ACCENT else "#33ecff",
                 fg="#0f0f0f"))
-            btn.bind("<Leave>", lambda e, b=btn: self._refresh_model_btns())
-        self._model_btns = mkr.winfo_children()
-        self._refresh_model_btns()
-        tk.Label(right, text="Downloaded automatically on first use (~6-25 MB)",
+            btn.bind("<Leave>", lambda e, b=btn: self._refresh_head_btns())
+        self._head_btns = hkr.winfo_children()
+        self._refresh_head_btns()
+        tk.Label(right, text="Primary detector \u2014 bundled with the app; "
+                 "bigger = more accurate, slower",
                  bg=BG, fg=TDIM, font=FS).pack(anchor="w", padx=8, pady=(0, 6))
 
         # ── Collapsible PARAMETERS ──
@@ -1362,8 +1441,13 @@ class App(tk.Tk):
                        bg=BG, fg=TMID, font=FS, selectcolor=BG3,
                        activebackground=BG, activeforeground=ACCENT
                        ).pack(side="left")
-        tk.Checkbutton(opts_row2, text="Detect whole head (incl. back)",
-                       variable=self._detect_head,
+        tk.Checkbutton(opts_row2, text="Person\u2192head aid (rescue)",
+                       variable=self._use_person_aid,
+                       bg=BG, fg=TMID, font=FS, selectcolor=BG3,
+                       activebackground=BG, activeforeground=ACCENT
+                       ).pack(side="left", padx=(12, 0))
+        tk.Checkbutton(opts_row2, text="Face safety net",
+                       variable=self._use_face,
                        bg=BG, fg=TMID, font=FS, selectcolor=BG3,
                        activebackground=BG, activeforeground=ACCENT
                        ).pack(side="left", padx=(12, 0))
@@ -1373,23 +1457,31 @@ class App(tk.Tk):
                        activebackground=BG, activeforeground=ACCENT
                        ).pack(side="left", padx=(12, 0))
 
-        # Head-model size selector (used when 'Detect whole head' is on).
-        head_row = tk.Frame(self._opts_body, bg=BG)
-        head_row.pack(fill="x", padx=8, pady=(2, 4))
-        tk.Label(head_row, text="Head model size:", bg=BG, fg=TMID,
-                 font=FS).pack(side="left")
-        _head_om = tk.OptionMenu(head_row, self._head_size, *HEAD_MODELS.keys())
-        _head_om.config(bg=BG3, fg=TEXT, font=FS, activebackground=BG3,
-                        activeforeground=ACCENT, highlightthickness=0,
-                        bd=0, cursor="hand2")
+        # Face-model selector: ONLY the face safety net uses this model, so it
+        # is enabled only when that toggle is on (the person->head aid uses a
+        # fixed COCO person model, not this one). Grayed out otherwise.
+        face_row = tk.Frame(self._opts_body, bg=BG)
+        face_row.pack(fill="x", padx=8, pady=(2, 4))
+        self._face_model_lbl = tk.Label(face_row, text="Face model:", bg=BG,
+                                        fg=TMID, font=FS)
+        self._face_model_lbl.pack(side="left")
+        self._face_om = tk.OptionMenu(face_row, self._model_key, *YOLO_MODELS.keys())
+        self._face_om.config(bg=BG3, fg=TEXT, font=FS, activebackground=BG3,
+                             activeforeground=ACCENT, highlightthickness=0,
+                             bd=0, cursor="hand2")
         try:
-            _head_om["menu"].config(bg=BG3, fg=TEXT, activebackground=ACCENT,
-                                    activeforeground=BG, font=FS)
+            self._face_om["menu"].config(bg=BG3, fg=TEXT, activebackground=ACCENT,
+                                         activeforeground=BG, font=FS)
         except Exception:
             pass
-        _head_om.pack(side="left", padx=6)
-        tk.Label(head_row, text="(needs 'Detect whole head' on; bigger = more "
-                 "accurate, slower)", bg=BG, fg=TDIM, font=FS).pack(side="left")
+        self._face_om.pack(side="left", padx=6)
+        self._face_model_hint = tk.Label(
+            face_row, text="(used only by the face safety net; downloaded on "
+            "first use)", bg=BG, fg=TDIM, font=FS)
+        self._face_model_hint.pack(side="left")
+        # React to the face-net toggle to enable/disable this selector.
+        self._use_face.trace_add("write", lambda *a: self._refresh_face_model_row())
+        self._refresh_face_model_row()
 
         suffix_row = tk.Frame(self._opts_body, bg=BG)
         suffix_row.pack(fill="x", padx=8, pady=(0, 8))
@@ -1585,8 +1677,10 @@ class App(tk.Tk):
         self._skip_frames.set(2)
         self._detect_scale.set(0.50)
         self._debug.set(False)
-        self._edge_strip.set(True)
-        self._detect_head.set(False)
+        self._edge_strip.set(False)
+        self._detect_head.set(True)
+        self._use_face.set(False)
+        self._use_person_aid.set(False)
         self._head_size.set(HEAD_MODEL_DEFAULT_KEY)
         self._smooth_boxes.set(True)
         self._export_report.set(False)
@@ -1594,6 +1688,8 @@ class App(tk.Tk):
         self._model_key.set(list(YOLO_MODELS.keys())[0])
         self._refresh_mode_btns()
         self._refresh_model_btns()
+        self._refresh_head_btns()
+        self._refresh_face_model_row()
         self._update_suffix_preview()
         # Delete settings file so it saves fresh
         try:
@@ -1680,21 +1776,42 @@ class App(tk.Tk):
             b.bind("<Leave>", _leave)
 
     def _refresh_model_btns(self):
-        cur = self._model_key.get()
-        for b in self._model_btns:
+        # The face model is now an OptionMenu (see _refresh_face_model_row), not
+        # a button row. Kept as a safe no-op so older call sites don't break.
+        return
+
+    def _refresh_head_btns(self):
+        """Highlight the selected head-model size button (primary detector)."""
+        cur = self._head_size.get()
+        for b in getattr(self, "_head_btns", []):
             active = (b["text"] == cur)
             b.config(bg=ACCENT if active else "#3a3a3a",
                      fg="#0f0f0f" if active else "#cccccc")
             def _enter(e, btn=b):
-                is_active = btn["text"] == self._model_key.get()
+                is_active = btn["text"] == self._head_size.get()
                 btn.config(bg="#33ecff" if is_active else "#505050",
                            fg="#0f0f0f")
             def _leave(e, btn=b):
-                is_active = btn["text"] == self._model_key.get()
+                is_active = btn["text"] == self._head_size.get()
                 btn.config(bg=ACCENT if is_active else "#3a3a3a",
                            fg="#0f0f0f" if is_active else "#cccccc")
             b.bind("<Enter>", _enter)
             b.bind("<Leave>", _leave)
+
+    def _refresh_face_model_row(self):
+        """Enable the face-model selector only when the face safety net is on;
+        it is the sole consumer of the selected model. Gray it out otherwise so
+        it is clear the choice has no effect."""
+        on = bool(self._use_face.get())
+        state = "normal" if on else "disabled"
+        try:
+            self._face_om.config(state=state)
+            self._face_model_lbl.config(fg=TMID if on else TDIM)
+            self._face_model_hint.config(
+                text=("(used only by the face safety net; downloaded on first use)"
+                      if on else "(enable 'Face safety net' to use a face model)"))
+        except Exception:
+            pass
 
     # ── DRAG AND DROP ─────────────────────────────────────
 
@@ -1740,6 +1857,8 @@ class App(tk.Tk):
             "detect_head": self._detect_head.get(),
             "head_size": self._head_size.get(),
             "smooth_boxes": self._smooth_boxes.get(),
+            "use_face": self._use_face.get(),
+            "use_person_aid": self._use_person_aid.get(),
         }
         save_settings(data)
 
@@ -1751,17 +1870,21 @@ class App(tk.Tk):
             keys = ["mode", "model_key", "confidence", "padding", "blur_k",
                     "pixel_sz", "debug", "skip_frames", "detect_scale",
                     "outdir", "suffix", "edge_strip", "export_report",
-                    "detect_head", "smooth_boxes", "head_size"]
+                    "detect_head", "smooth_boxes", "head_size",
+                    "use_face", "use_person_aid"]
             targets = [self._mode, self._model_key, self._conf, self._pad,
                        self._blur_k, self._pixel_sz, self._debug,
                        self._skip_frames, self._detect_scale, self._outdir,
                        self._suffix, self._edge_strip, self._export_report,
-                       self._detect_head, self._smooth_boxes, self._head_size]
+                       self._detect_head, self._smooth_boxes, self._head_size,
+                       self._use_face, self._use_person_aid]
             for k, t in zip(keys, targets):
                 if k in data:
                     t.set(data[k])
             self._refresh_mode_btns()
             self._refresh_model_btns()
+            self._refresh_head_btns()
+            self._refresh_face_model_row()
         except Exception:
             pass
 
@@ -1988,8 +2111,10 @@ class App(tk.Tk):
                 if not ok: return
                 boxes = detect_objects(frame, detector, head_model, person_model,
                                        cfg["confidence"], cfg["detect_scale"],
-                                       cfg["edge_strip"], cfg.get("detect_head", False),
-                                       head_is_user=head_is_user)
+                                       cfg["edge_strip"], cfg.get("detect_head", True),
+                                       head_is_user=head_is_user,
+                                       use_face=cfg.get("use_face", False),
+                                       use_person_aid=cfg.get("use_person_aid", False))
                 preview = apply_censor(frame.copy(), boxes,
                                        cfg["mode"], cfg["padding"],
                                        cfg["intensity"], cfg["block_size"],
@@ -2012,17 +2137,16 @@ class App(tk.Tk):
                 if cfg.get("detect_head"):
                     try:
                         hc = max(0.15, cfg["confidence"] - HEAD_CONF_DROP)
-                        if person_model is not None and _person_head_active(head_model, head_is_user):
+                        if person_model is not None and cfg.get("use_person_aid", False):
                             hr = detect_faces(frame, person_model, hc,
                                               1.0, edge_strip=False,
                                               classes=[HEAD_PERSON_CLASS])
                             hb = _person_to_head(hr)
-                            self._write_log("  Person -> head regions: {} "
+                            self._write_log("  Person \u2192 head regions: {} "
                                             "on first frame\n".format(len(hb)),
                                             "dim" if hb else "warning")
                         elif person_model is not None:
-                            self._write_log("  Person -> head pass: disabled "
-                                            "(head.pt is primary)\n", "dim")
+                            self._write_log("  Person \u2192 head aid: OFF\n", "dim")
                         if head_model is not None:
                             hb2 = detect_faces(frame, head_model, hc, 1.0,
                                                cfg["edge_strip"],
@@ -2063,6 +2187,8 @@ class App(tk.Tk):
             "edge_strip":    self._edge_strip.get(),
             "detect_head":   self._detect_head.get(),
             "head_size":     self._head_size.get(),
+            "use_face":      self._use_face.get(),
+            "use_person_aid": self._use_person_aid.get(),
             "smooth_boxes":  self._smooth_boxes.get(),
             "export_report": self._export_report.get(),
         }
@@ -2100,40 +2226,38 @@ class App(tk.Tk):
         head_model = None
         person_model = None
         head_is_user = False
-        if cfg.get("detect_head"):
-            self._write_log("Whole-head detection ON. Loading head detectors...\n", "accent")
+        if cfg.get("detect_head", True):
+            self._write_log("Head detection ON (primary method). Loading head model...\n", "accent")
             try:
                 head_model, person_model, head_is_user = get_head_detector(
                     head_size=cfg.get("head_size"), log_fn=self._write_log)
                 methods = []
-                person_on = person_model is not None and _person_head_active(head_model, head_is_user)
-                if person_on:
-                    methods.append("person -> head region")
+                person_on = person_model is not None and cfg.get("use_person_aid", False)
                 if head_model is not None:
-                    methods.append("dedicated head model (head.pt)")
-                if methods:
+                    methods.append("head model (primary)")
+                if person_on:
+                    methods.append("person\u2192head rescue aid")
+                if cfg.get("edge_strip"):
+                    methods.append("edge strips")
+                if cfg.get("use_face"):
+                    methods.append("face safety net")
+                if head_model is not None:
                     self._write_log("Head detection OK ({}).\n".format(
                         " + ".join(methods)), "accent")
-                    if head_model is None:
-                        self._write_log("  No head.pt found: back-of-head coverage "
-                                        "relies on person detection (needs some "
-                                        "torso in frame).\n  Run test_models.py to "
-                                        "pick a head.pt for this footage.\n", "warning")
-                    if head_model is not None:
-                        try:
-                            self._write_log("  Head classes: {}\n".format(
-                                head_model.names), "dim")
-                        except Exception:
-                            pass
+                    try:
+                        self._write_log("  Head classes: {}\n".format(
+                            head_model.names), "dim")
+                    except Exception:
+                        pass
                     if person_model is not None and not person_on:
-                        self._write_log("  Person -> head pass: disabled "
-                                        "(your head.pt is primary; avoids "
-                                        "weapon/gear false boxes).\n", "dim")
+                        self._write_log("  Person\u2192head aid: OFF "
+                                        "(enable it to rescue weak head "
+                                        "detections).\n", "dim")
                 else:
-                    self._write_log("[ERROR] Whole-head is ON but NO head/person "
-                                    "model loaded -> this run will be FACE-ONLY.\n"
-                                    "        The models download on first run; check "
-                                    "internet access and the warnings above.\n", "error")
+                    self._write_log("[ERROR] Head detection is ON but NO head "
+                                    "model loaded.\n        The model downloads on "
+                                    "first run; check internet access and the "
+                                    "warnings above.\n", "error")
                     try:
                         self.after(0, lambda: messagebox.showwarning(
                             "Whole-head detection unavailable",
@@ -2248,8 +2372,10 @@ class App(tk.Tk):
                     boxes = detect_objects(frame, detector, head_model, person_model,
                                            cfg["confidence"], dscale,
                                            cfg["edge_strip"],
-                                           cfg.get("detect_head", False),
-                                           head_is_user=head_is_user)
+                                           cfg.get("detect_head", True),
+                                           head_is_user=head_is_user,
+                                           use_face=cfg.get("use_face", False),
+                                           use_person_aid=cfg.get("use_person_aid", False))
                     if use_tracker:
                         try: tracker.update_from_detection(frame, boxes)
                         except Exception: use_tracker = False
@@ -2470,7 +2596,7 @@ class SplashScreen(tk.Tk):
         inner.pack(fill="both", expand=True)
         tk.Label(inner, text="FACEBLUR", bg="#0f0f0f", fg="#00e5ff",
                  font=("Courier New", 32, "bold")).pack(pady=(30, 4))
-        tk.Label(inner, text="YOLOv11 face censoring  v1.3  |  made by werehappy",
+        tk.Label(inner, text="YOLOv11 head & face censoring  v1.4  |  made by werehappy",
                  bg="#0f0f0f", fg="#444444",
                  font=("Courier New", 9)).pack()
         self._status = tk.Label(inner, text="Starting...",

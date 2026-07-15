@@ -57,6 +57,11 @@ for its geometric fallback, otherwise you are evaluating a different baseline
 than the one the runtime policy disables.
 """
 
+import os as _os
+# Must be set before torch initializes CUDA (torch is imported lazily below):
+# reduces fragmentation ("N GiB reserved but unallocated") on long multi-model runs.
+_os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import csv
 import os
@@ -238,6 +243,35 @@ def ap_at(preds_by_img, gts_by_img, keys, iou_thr):
     return ap
 
 
+def _report_vram(tag):
+    """Print allocated CUDA memory so leaks are visible in the console."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gib = torch.cuda.memory_allocated() / (1024 ** 3)
+            print("  [mem] {}: {:.2f} GiB allocated".format(tag, gib))
+    except Exception:
+        pass
+
+
+def _free_cuda():
+    """Reclaim GPU memory AFTER the caller has dropped its model reference
+    (model = None). Must run after, not before: ultralytics models sit in
+    reference cycles (model <-> predictor/validator callbacks), so they are
+    only collectable by gc once no outside reference remains. Without this,
+    every model evaluated in one invocation stays resident and the last
+    stage OOMs with ~20 GiB "allocated" on a 12 GiB card.
+    """
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def eval_geom_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows):
     """Run each --geom-model once over all images, convert person boxes to head
     estimates, then score every domain subset with the built-in matcher."""
@@ -269,10 +303,14 @@ def eval_geom_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows)
         # stream=True yields one Results at a time; batch=1 and per-frame cache
         # clearing keep peak GPU memory to a single image regardless of test-set
         # size. We copy out plain Python floats and never retain the Results.
-        stream = model.predict(imgs, stream=True, imgsz=args.imgsz, conf=floor,
-                               device=args.device, classes=[args.person_class],
-                               batch=1, verbose=False)
-        for img_path, res in zip(imgs, stream):
+        # One predict() call PER IMAGE. Never hand predict() the whole list:
+        # some ultralytics versions ignore/reject the batch kwarg for list
+        # sources and build ONE batch out of every image, which tries to
+        # allocate tens of GiB in a single conv (observed: 17.88 GiB).
+        for img_path in imgs:
+            res = model.predict(img_path, imgsz=args.imgsz, conf=floor,
+                                device=args.device, classes=[args.person_class],
+                                verbose=False)[0]
             key = os.path.abspath(img_path)
             boxes = res.boxes
             preds = []
@@ -290,7 +328,6 @@ def eval_geom_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows)
             del res, boxes
             if _cuda:
                 torch.cuda.empty_cache()
-
         for dom, paths in eval_sets:
             keys = [os.path.abspath(p) for p in paths]
             recall, precision, f1, _ = op_metrics(preds_by_img, gts_by_img, keys,
@@ -307,11 +344,371 @@ def eval_geom_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows)
                              map50=map50, map50_95=map5095))
             print("  {:<12} R={} P={} F1={} mAP50={}".format(
                 dom, _fmt(recall), _fmt(precision), _fmt(f1), _fmt(map50)))
+        model = None
+        _free_cuda()
+        _report_vram("after releasing " + name)
 
 
 # --------------------------------------------------------------------------- #
 # metric collection (needs ultralytics)
 # --------------------------------------------------------------------------- #
+
+def _prior_overlap(box, priors):
+    """Soft overlap between a head detection and the person->head prior set.
+    Max IoU over priors; a detection whose CENTER falls inside a prior counts
+    at least 0.5 even when box sizes disagree (the prior is a coarse region,
+    not a tight box, so IoU alone under-credits correct-but-small heads)."""
+    best = 0.0
+    cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+    for _pc, pb in priors:
+        v = iou_xyxy(box, pb)
+        if pb[0] <= cx <= pb[2] and pb[1] <= cy <= pb[3]:
+            v = max(v, 0.5)
+        if v > best:
+            best = v
+    return best
+
+
+
+def _build_priors(args, imgs):
+    """One person-model pass -> {abs_img_path: [(person_conf, head_region_xyxy)]}.
+    Shared by the fused (--fuse) and combined (--edge-fuse) modes."""
+    from ultralytics import YOLO
+    try:
+        import torch
+        _cuda = torch.cuda.is_available()
+    except Exception:
+        torch, _cuda = None, False
+    print("\n=== building person->head priors ({}, w_frac={}, aspect={}) ===".format(
+        args.fuse_person, args.geom_w_frac, args.geom_aspect))
+    person = YOLO(args.fuse_person)
+    priors_by_img = {}
+    # per-image predict; see eval_geom_models for why the list form is unsafe
+    for img_path in imgs:
+        res = person.predict(img_path, imgsz=args.imgsz, conf=max(0.05, args.geom_conf_floor),
+                             device=args.device, classes=[args.person_class],
+                             verbose=False)[0]
+        pri = []
+        if res.boxes is not None and len(res.boxes):
+            confs = res.boxes.conf.detach().cpu().tolist()
+            xyxys = res.boxes.xyxy.detach().cpu().tolist()
+            for c, pb in zip(confs, xyxys):
+                pri.append((float(c), head_from_person(tuple(pb),
+                                                       args.geom_w_frac, args.geom_aspect)))
+        priors_by_img[os.path.abspath(img_path)] = pri
+        del res
+        if _cuda:
+            torch.cuda.empty_cache()
+    person = None
+    _free_cuda()
+    _report_vram("after releasing person prior model")
+    return priors_by_img
+
+
+def _apply_prior(preds, priors, args):
+    """Prior-guided re-scoring of candidate head boxes (the fusion step).
+    preds: [(conf, xyxy)]. Returns the fused prediction list:
+    detections boosted by overlap with priors; unclaimed priors injected
+    at person_conf * beta (skipped entirely when beta == 0)."""
+    fused = []
+    boxes = [b for _c, b in preds]
+    for c, hb in preds:
+        ov = _prior_overlap(hb, priors)
+        fused.append((min(1.0, c * (1.0 + args.fuse_alpha * ov)), hb))
+    if args.fuse_beta > 0:
+        for pc, pb in priors:
+            if all(iou_xyxy(pb, hb) < 0.30 for hb in boxes):
+                fused.append((pc * args.fuse_beta, pb))
+    return fused
+
+
+def _edge_collect(model, img_path, args, floor, strip_op_conf):
+    """The app's edge-strip detect pass on ONE image: full frame + four
+    full-resolution strips, boxes translated to frame coords, deduplicated
+    confidence-descending at IoU 0.4 (face_blur.py _dedup_boxes semantics).
+    Returns (preds, (h, w)) or (None, None) if the image is unreadable."""
+    import cv2
+    frame = cv2.imread(img_path)
+    if frame is None:
+        return None, None
+    h, w = frame.shape[:2]
+    e = args.edge_frac
+    crops = [(frame, 0, 0)]
+    for sx1, sy1, sx2, sy2 in [(0, 0, int(w*e), h), (int(w*(1-e)), 0, w, h),
+                               (0, 0, w, int(h*e)), (0, int(h*(1-e)), w, h)]:
+        strip = frame[sy1:sy2, sx1:sx2]
+        if strip.size:
+            crops.append((strip, sx1, sy1))
+    preds = []
+    for idx, (im, ox, oy) in enumerate(crops):
+        res = model.predict(im, imgsz=args.imgsz, conf=floor,
+                            device=args.device, verbose=False)[0]
+        if res.boxes is not None and len(res.boxes):
+            confs = res.boxes.conf.detach().cpu().tolist()
+            xyxys = res.boxes.xyxy.detach().cpu().tolist()
+            for c, b in zip(confs, xyxys):
+                c = float(c)
+                # strip boxes that clear the strip threshold but not --conf
+                # are promoted to exactly --conf so op_metrics matches the
+                # deployed behaviour (strips may run at a lower conf)
+                if idx > 0 and strip_op_conf <= c < args.conf:
+                    c = args.conf
+                preds.append((c, (b[0]+ox, b[1]+oy, b[2]+ox, b[3]+oy)))
+        del res
+    return _dedup_conf_desc(preds, 0.40), (h, w)
+
+
+def _score_rows(args, preds_by_img, gts_by_img, eval_sets, heads, rows, row_name):
+    """Score one prediction set over every domain subset and append rows."""
+    for dom, paths in eval_sets:
+        keys = [os.path.abspath(p) for p in paths]
+        recall, precision, f1, _ = op_metrics(preds_by_img, gts_by_img, keys,
+                                              args.conf, args.geom_iou)
+        map50 = map5095 = float("nan")
+        if not args.no_map:
+            map50 = ap_at(preds_by_img, gts_by_img, keys, 0.5)
+            aps = [ap_at(preds_by_img, gts_by_img, keys, 0.5 + 0.05 * j) for j in range(10)]
+            aps = [a for a in aps if a == a]
+            map5095 = sum(aps) / len(aps) if aps else float("nan")
+        n_heads = heads[dom] if dom != "ALL" else sum(heads.values())
+        rows.append(dict(model=row_name, domain=dom, images=len(paths), heads=n_heads,
+                         recall=recall, precision=precision, f1=f1,
+                         map50=map50, map50_95=map5095))
+        print("  {:<12} R={} P={} F1={} mAP50={}".format(
+            dom, _fmt(recall), _fmt(precision), _fmt(f1), _fmt(map50)))
+
+
+def eval_combo_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows, priors_by_img=None):
+    """Combined mode (--edge-fuse): edge strips AND the person->head prior
+    together, i.e. the app's actual runtime configuration. Per image: the
+    edge-strip pass collects and dedups candidates, then the prior re-scores
+    them (and injects unclaimed priors if beta > 0). Rows: '<name>+edge+prior'.
+    Costs 5 head inferences per image plus one shared person pass."""
+    from ultralytics import YOLO
+    try:
+        import torch
+        _cuda = torch.cuda.is_available()
+    except Exception:
+        torch, _cuda = None, False
+
+    if priors_by_img is None:
+        priors_by_img = _build_priors(args, imgs)
+
+    floor = 0.05
+    strip_op_conf = max(0.10, args.conf - args.edge_conf_drop)
+    for name, weights in args.edge_fuse:
+        if not os.path.exists(weights):
+            print("[warn] skipping edge-fuse '{}': weights not found ({})".format(name, weights))
+            continue
+        print("\n=== combined model: {}+edge+prior ({}; frac={}, alpha={}, beta={}) ===".format(
+            name, weights, args.edge_frac, args.fuse_alpha, args.fuse_beta))
+        model = YOLO(weights)
+        preds_by_img, gts_by_img = {}, {}
+        for img_path in imgs:
+            key = os.path.abspath(img_path)
+            preds, shape = _edge_collect(model, img_path, args, floor, strip_op_conf)
+            if preds is None:
+                continue
+            preds_by_img[key] = _apply_prior(preds, priors_by_img.get(key, []), args)
+            gts_by_img[key] = load_gt_boxes(img_path, images_dir, labels_dir, shape)
+            if _cuda:
+                torch.cuda.empty_cache()
+        model = None
+        _free_cuda()
+        _report_vram("after releasing " + name)
+        _score_rows(args, preds_by_img, gts_by_img, eval_sets, heads, rows, name + "+edge+prior")
+
+
+def eval_fused_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows, priors_by_img=None):
+    """Prior-guided ("heatmap") evaluation: the COCO person detector defines
+    soft head-region priors; the head model's detections are re-scored by their
+    overlap with those priors, and unclaimed priors are added as weak
+    geometry-only boxes.
+
+      fused_conf(head box)  = min(1, conf * (1 + alpha * overlap))
+      fused_conf(prior box) = person_conf * beta      (only if no head box
+                                                       overlaps that prior)
+
+    The head model runs at a LOW floor (--fuse-floor, default 0.10): weak
+    detections inside a prior get boosted past the operating point (the
+    "rescue"); weak detections in the open stay below it. Scored with the
+    same matcher/AP as the geometric baseline. NOTE: the AP curve is
+    truncated at the floor, so fused mAP is slightly conservative.
+    """
+    from ultralytics import YOLO
+
+    try:
+        import torch
+        _cuda = torch.cuda.is_available()
+    except Exception:
+        torch, _cuda = None, False
+
+    # NOTE: no existence check here -- ultralytics auto-downloads official
+    # names like "yolo11n.pt"; a bad local path fails loudly below instead.
+
+    if priors_by_img is None:
+        priors_by_img = _build_priors(args, imgs)
+
+    # ---- pass 2: each head model at a low floor, fused with the priors ----
+    for name, weights in args.fuse:
+        if not os.path.exists(weights):
+            print("[warn] skipping fused '{}': weights not found ({})".format(name, weights))
+            continue
+        print("\n=== fused model: {}+prior ({}; floor={}, alpha={}, beta={}) ===".format(
+            name, weights, args.fuse_floor, args.fuse_alpha, args.fuse_beta))
+        model = YOLO(weights)
+        preds_by_img, gts_by_img = {}, {}
+        # per-image predict; see eval_geom_models for why the list form is unsafe
+        for img_path in imgs:
+            res = model.predict(img_path, imgsz=args.imgsz, conf=args.fuse_floor,
+                                device=args.device, verbose=False)[0]
+            key = os.path.abspath(img_path)
+            priors = priors_by_img.get(key, [])
+            preds = []
+            head_boxes = []
+            if res.boxes is not None and len(res.boxes):
+                confs = res.boxes.conf.detach().cpu().tolist()
+                xyxys = res.boxes.xyxy.detach().cpu().tolist()
+                for c, hb in zip(confs, xyxys):
+                    hb = tuple(hb)
+                    ov = _prior_overlap(hb, priors)
+                    preds.append((min(1.0, float(c) * (1.0 + args.fuse_alpha * ov)), hb))
+                    head_boxes.append(hb)
+            # unclaimed priors -> weak geometry-only boxes (never full conf:
+            # gear-forward poses misplace the region, see face_blur.py notes)
+            for pc, pb in priors:
+                if all(iou_xyxy(pb, hb) < 0.30 for hb in head_boxes):
+                    preds.append((pc * args.fuse_beta, pb))
+            preds_by_img[key] = preds
+            gts_by_img[key] = load_gt_boxes(img_path, images_dir, labels_dir, res.orig_shape)
+            del res
+            if _cuda:
+                torch.cuda.empty_cache()
+        for dom, paths in eval_sets:
+            keys = [os.path.abspath(p) for p in paths]
+            recall, precision, f1, _ = op_metrics(preds_by_img, gts_by_img, keys,
+                                                  args.conf, args.geom_iou)
+            map50 = map5095 = float("nan")
+            if not args.no_map:
+                map50 = ap_at(preds_by_img, gts_by_img, keys, 0.5)
+                aps = [ap_at(preds_by_img, gts_by_img, keys, 0.5 + 0.05 * j) for j in range(10)]
+                aps = [a for a in aps if a == a]
+                map5095 = sum(aps) / len(aps) if aps else float("nan")
+            n_heads = heads[dom] if dom != "ALL" else sum(heads.values())
+            rows.append(dict(model=name + "+prior", domain=dom, images=len(paths), heads=n_heads,
+                             recall=recall, precision=precision, f1=f1,
+                             map50=map50, map50_95=map5095))
+            print("  {:<12} R={} P={} F1={} mAP50={}".format(
+                dom, _fmt(recall), _fmt(precision), _fmt(f1), _fmt(map50)))
+        model = None
+        _free_cuda()
+        _report_vram("after releasing " + name)
+
+
+
+def _dedup_conf_desc(preds, iou_thresh=0.40):
+    """Confidence-descending IoU dedup, replicating face_blur.py's
+    _dedup_boxes(): the highest-confidence box wins; any box overlapping a
+    kept box above the threshold is suppressed. preds: [(conf, xyxy)]."""
+    kept = []
+    for conf, box in sorted(preds, key=lambda t: -t[0]):
+        if all(iou_xyxy(box, kb) <= iou_thresh for _c, kb in kept):
+            kept.append((conf, box))
+    return kept
+
+
+def eval_edge_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows):
+    """Edge-strip ablation: replicate the app's detect pass (face_blur.py
+    detect_faces with edge_strip=True) and score it with the custom matcher.
+
+    Per image: one full-frame pass, plus four full-resolution strips covering
+    --edge-frac (default 0.20) of each side, run at (conf - --edge-conf-drop,
+    floored at 0.10); strip boxes are translated back to frame coordinates and
+    the union is deduplicated confidence-descending at IoU 0.4, exactly as in
+    the app. Rows are named '<name>+edge'; run the same weights via --model
+    for the no-strip ablation row. Costs 5 inferences per image.
+
+    NOTE: candidate boxes are collected from conf 0.05 up so the AP curve is
+    meaningful, but the strip conf-drop is applied RELATIVE to --conf when
+    filtering at the operating point, mirroring deployment.
+    """
+    from ultralytics import YOLO
+    import cv2
+
+    try:
+        import torch
+        _cuda = torch.cuda.is_available()
+    except Exception:
+        torch, _cuda = None, False
+
+    floor = 0.05
+    strip_op_conf = max(0.10, args.conf - args.edge_conf_drop)
+
+    for name, weights in args.edge:
+        if not os.path.exists(weights):
+            print("[warn] skipping edge '{}': weights not found ({})".format(name, weights))
+            continue
+        print("\n=== edge-strip model: {}+edge ({}; frac={}, strip conf={}) ===".format(
+            name, weights, args.edge_frac, strip_op_conf))
+        model = YOLO(weights)
+        preds_by_img, gts_by_img = {}, {}
+        for img_path in imgs:
+            key = os.path.abspath(img_path)
+            frame = cv2.imread(img_path)
+            if frame is None:
+                continue
+            h, w = frame.shape[:2]
+            e = args.edge_frac
+            crops = [(frame, 0, 0)]
+            for sx1, sy1, sx2, sy2 in [(0, 0, int(w*e), h), (int(w*(1-e)), 0, w, h),
+                                       (0, 0, w, int(h*e)), (0, int(h*(1-e)), w, h)]:
+                strip = frame[sy1:sy2, sx1:sx2]
+                if strip.size:
+                    crops.append((strip, sx1, sy1))
+            preds = []
+            for idx, (im, ox, oy) in enumerate(crops):
+                res = model.predict(im, imgsz=args.imgsz, conf=floor,
+                                    device=args.device, verbose=False)[0]
+                if res.boxes is not None and len(res.boxes):
+                    confs = res.boxes.conf.detach().cpu().tolist()
+                    xyxys = res.boxes.xyxy.detach().cpu().tolist()
+                    for c, b in zip(confs, xyxys):
+                        c = float(c)
+                        # strips run at a (possibly) lower operating conf than
+                        # the main pass; below-op boxes are kept for the AP
+                        # curve but flagged so op_metrics at --conf matches
+                        # deployment: promote strip boxes that clear the strip
+                        # threshold but not --conf up to --conf exactly.
+                        if idx > 0 and strip_op_conf <= c < args.conf:
+                            c = args.conf
+                        preds.append((c, (b[0]+ox, b[1]+oy, b[2]+ox, b[3]+oy)))
+                del res
+            if _cuda:
+                torch.cuda.empty_cache()
+            preds_by_img[key] = _dedup_conf_desc(preds, 0.40)
+            gts_by_img[key] = load_gt_boxes(img_path, images_dir, labels_dir, (h, w))
+        model = None
+        _free_cuda()
+        _report_vram("after releasing " + name)
+
+        for dom, paths in eval_sets:
+            keys = [os.path.abspath(p) for p in paths]
+            recall, precision, f1, _ = op_metrics(preds_by_img, gts_by_img, keys,
+                                                  args.conf, args.geom_iou)
+            map50 = map5095 = float("nan")
+            if not args.no_map:
+                map50 = ap_at(preds_by_img, gts_by_img, keys, 0.5)
+                aps = [ap_at(preds_by_img, gts_by_img, keys, 0.5 + 0.05 * j) for j in range(10)]
+                aps = [a for a in aps if a == a]
+                map5095 = sum(aps) / len(aps) if aps else float("nan")
+            n_heads = heads[dom] if dom != "ALL" else sum(heads.values())
+            rows.append(dict(model=name + "+edge", domain=dom, images=len(paths), heads=n_heads,
+                             recall=recall, precision=precision, f1=f1,
+                             map50=map50, map50_95=map5095))
+            print("  {:<12} R={} P={} F1={} mAP50={}".format(
+                dom, _fmt(recall), _fmt(precision), _fmt(f1), _fmt(map50)))
+
+
 def evaluate(model, tmp_yaml, imgsz, device, conf):
     """One ultralytics val pass. Returns (recall, precision, map50, map5095)."""
     kw = dict(data=tmp_yaml, imgsz=imgsz, device=device, split="val",
@@ -406,9 +803,23 @@ def collect_rows(args):
                              map50=map50, map50_95=map5095))
             print("  {:<12} R={} P={} F1={} mAP50={}".format(
                 dom, _fmt(recall), _fmt(precision), _fmt(f1), _fmt(map50)))
+        model = None
+        _free_cuda()
+        _report_vram("after releasing " + name)
 
     if args.geom_models:
         eval_geom_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows)
+    priors_cache = None
+    if args.fuse or args.edge_fuse:
+        priors_cache = _build_priors(args, imgs)
+    if args.fuse:
+        eval_fused_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows,
+                          priors_by_img=priors_cache)
+    if args.edge:
+        eval_edge_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows)
+    if args.edge_fuse:
+        eval_combo_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows,
+                          priors_by_img=priors_cache)
     return rows, ordered
 
 
@@ -564,6 +975,33 @@ def main():
                     help="lowest person-detection confidence kept for the geometric "
                          "baseline mAP curve (default 0.05; raise toward --conf if you "
                          "hit GPU OOM on dense scenes, lower for a longer PR tail)")
+    ap.add_argument("--edge-fuse", action="append", dest="edge_fuse", type=parse_model, default=[],
+                    help="name:weights evaluated with edge strips AND the person->head prior "
+                         "together -- the app's runtime configuration (repeatable). Rows: "
+                         "'<name>+edge+prior'. Uses the --edge-* and --fuse-* parameters.")
+    ap.add_argument("--edge", action="append", dest="edge", type=parse_model, default=[],
+                    help="name:weights of a head model to evaluate WITH the app's "
+                         "edge-strip pass (repeatable). Produces rows named '<name>+edge'; "
+                         "run the same weights via --model for the no-strip ablation row.")
+    ap.add_argument("--edge-frac", type=float, default=0.20,
+                    help="strip width as a fraction of each side (default 0.20, as in the app)")
+    ap.add_argument("--edge-conf-drop", type=float, default=0.0,
+                    help="strip confidence drop relative to --conf (default 0.0, the app's "
+                         "head-pass setting; the face pass uses 0.1)")
+    ap.add_argument("--fuse", action="append", dest="fuse", type=parse_model, default=[],
+                    help="name:weights of a head model to evaluate WITH the person->head "
+                         "prior (repeatable). Produces rows named '<name>+prior'. "
+                         "Run the same weights via --model too for the unguided ablation row.")
+    ap.add_argument("--fuse-person", default="yolo11n.pt",
+                    help="COCO person weights used to build the priors (default yolo11n.pt)")
+    ap.add_argument("--fuse-floor", type=float, default=0.10,
+                    help="head-model confidence floor for fusion candidates (default 0.10). "
+                         "Weak boxes above this can be rescued by the prior.")
+    ap.add_argument("--fuse-alpha", type=float, default=1.0,
+                    help="prior boost strength: conf*(1+alpha*overlap) (default 1.0)")
+    ap.add_argument("--fuse-beta", type=float, default=0.5,
+                    help="confidence multiplier for geometry-only boxes from unclaimed "
+                         "priors (default 0.5); set 0 to disable adding them")
     ap.add_argument("--split", default="test", help="split to evaluate (default test)")
     ap.add_argument("--imgsz", type=int, default=960, help="inference size (match the app, default 960)")
     ap.add_argument("--conf", type=float, default=0.25, help="operating-point confidence (default 0.25)")

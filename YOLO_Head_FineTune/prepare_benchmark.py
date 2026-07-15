@@ -99,9 +99,18 @@ def voc_boxes(xml_path: Path):
         name = (obj.findtext("name") or "").strip().lower()
         difficult = (obj.findtext("difficult") or "0").strip() in ("1", "true")
         bb = obj.find("bndbox")
+        if bb is None:
+            # Some releases (e.g. Casablanca) contain <object> entries without
+            # a <bndbox>. Signal it with name "(no bndbox)" so main() can count.
+            yield (name, difficult, None, None, None, None, w, h)
+            continue
+        coords = [bb.findtext(k) for k in ("xmin", "ymin", "xmax", "ymax")]
+        if any(c is None for c in coords):
+            yield (name, difficult, None, None, None, None, w, h)
+            continue
         yield (name, difficult,
-               float(bb.findtext("xmin")), float(bb.findtext("ymin")),
-               float(bb.findtext("xmax")), float(bb.findtext("ymax")), w, h)
+               float(coords[0]), float(coords[1]),
+               float(coords[2]), float(coords[3]), w, h)
 
 
 def main():
@@ -130,7 +139,7 @@ def main():
     out_img.mkdir(parents=True, exist_ok=True)
     out_lbl.mkdir(parents=True, exist_ok=True)
 
-    n_imgs = n_boxes = n_dropped = n_nonhead = n_missing = n_difficult = 0
+    n_imgs = n_boxes = n_dropped = n_nonhead = n_missing = n_difficult = n_noboxes = 0
     nonhead_names = {}
     for stem in stems:
         xml_path = ann_dir / (stem + ".xml")
@@ -147,6 +156,9 @@ def main():
         lines = []
         n_difficult_here = 0
         for name, difficult, x1, y1, x2, y2, w, h in voc_boxes(xml_path):
+            if x1 is None:
+                n_noboxes += 1
+                continue
             if name not in HEAD_NAMES:
                 n_nonhead += 1
                 nonhead_names[name] = nonhead_names.get(name, 0) + 1
@@ -186,6 +198,8 @@ def main():
         print("  [warn] {} split entries missing an image or xml".format(n_missing))
     if n_dropped:
         print("  [warn] {} degenerate boxes dropped".format(n_dropped))
+    if n_noboxes:
+        print("  [note] {} <object> entries had no/incomplete <bndbox> and were skipped".format(n_noboxes))
     if n_difficult:
         print("  [note] {} 'difficult' heads {} (policy: --difficult {}). Published"
               " protocols score these as ignore regions; with 'drop', your recall"

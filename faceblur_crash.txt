@@ -1,0 +1,8 @@
+
+=== 2026-07-15T16:40:00.645703 ===
+Top-level import failed:
+Traceback (most recent call last):
+  File "C:\Users\seoul\Desktop\Joontae\executable\YOLO Setup\face_blur.py", line 2955, in <module>
+    import cv2 as _cv2
+ModuleNotFoundError: No module named 'cv2'
+

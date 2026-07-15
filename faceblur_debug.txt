@@ -1,4 +1,8 @@
 Venv path: C:\Users\seoul\Desktop\Joontae\executable\YOLO Setup\faceblur_env
 Venv exists: True
-Already on path: C:\Users\seoul\Desktop\Joontae\executable\YOLO Setup\faceblur_env\Lib\site-packages
+Added: C:\Users\seoul\Desktop\Joontae\executable\YOLO Setup\faceblur_env\Lib\site-packages
+Added scripts: C:\Users\seoul\Desktop\Joontae\executable\YOLO Setup\faceblur_env\Scripts
+Added stdlib zip: C:\Users\seoul\Desktop\Joontae\executable\YOLO Setup\faceblur_env\python310.zip
+Added stdlib dir: C:\Users\seoul\Desktop\Joontae\executable\YOLO Setup\faceblur_env
+Added stdlib dir: C:\Users\seoul\Desktop\Joontae\executable\YOLO Setup\faceblur_env\Lib
 Result: found
