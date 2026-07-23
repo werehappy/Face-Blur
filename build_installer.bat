@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 echo.
 echo ==================================================
-echo   FACEBLUR v1.4  --  Build Installer (small / no torch bundled)
+echo   FACEBLUR v1.4.2  --  Build Installer (small / no torch bundled)
 echo ==================================================
 echo.
 
@@ -68,6 +68,22 @@ for %%M in (head_n.pt head_s.pt head_m.pt) do (
     )
 )
 echo       head models OK.
+
+:: person prior models (v1.4.1): the tuned person->head rescue aid pairs
+:: head_n with yolo11s and head_s/head_m with yolo11m. Bundle them so the
+:: tuned config works offline on first run. Fetch any that are missing from
+:: the same ultralytics assets release the app uses; a failure here is not
+:: fatal (the app auto-downloads at runtime and the installer marks them
+:: skipifsourcedoesntexist), so we only warn.
+for %%P in (yolo11n yolo11s yolo11m) do (
+    if not exist "%~dp0%%P.pt" (
+        echo       Downloading %%P.pt ...
+        powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+            "try { Invoke-WebRequest -Uri 'https://github.com/ultralytics/assets/releases/download/v8.3.0/%%P.pt' -OutFile '%~dp0%%P.pt' } catch { exit 1 }"
+        if errorlevel 1 echo [WARN] could not fetch %%P.pt - app will download it at runtime.
+    )
+)
+echo       person prior models ready ^(bundled if present^).
 
 :: Step 0: Build-env packages.
 :: NOTE: we install CPU torch in the BUILD env only so PyInstaller can analyze

@@ -1,5 +1,5 @@
 REM HollywoodHeads — official test split (1,302 frames: Gandhi, Charade, I Am Sam)
-python prepare_benchmark.py --src HollywoodHeads --out bench\hh --split test --copy-images
+python prepare_benchmark.py --src Model_Compare/HollywoodHeads --out bench\hh --split test --copy-images
 
 REM Casablanca — use Vu et al.'s improved annotations if the release includes them
 python prepare_benchmark.py --src Casablanca --out bench\casa --split test --copy-images

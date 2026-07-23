@@ -25,3 +25,12 @@ combined
 python eval_compare.py --data head_test/data.yaml --split val --model head_n:head_n.pt --model head_s:head_s.pt --model head_m:head_m.pt --edge-fuse head_n:head_n.pt --edge-fuse head_s:head_s.pt --edge-fuse head_m:head_m.pt --fuse-beta 0 --imgsz 960 --conf 0.25
 
 python eval_compare.py --data head_test\data.yaml --split test --model head_s:...\head_s\weights\best.pt --edge head_s:...\head_s\weights\best.pt --imgsz 960 --conf 0.25
+
+python eval_compare.py --data head_test/data.yaml --split val --model head_s:head_s.pt --fuse head_s:head_s.pt --fuse-person yolo11m.pt --fuse-alpha 1.5 --fuse-beta 0.0 --fuse-floor 0.05 --domain catwalk:catwalk --domain helmet:helmet,test0706,test0707 --domain mixed:ultimateTest --bootstrap 1000 --imgsz 960 --conf 0.25 --out paper_eval/0722/
+
+
+
+
+
+
+python eval_compare.py --data head_test/data.yaml --split val --model head_n:head_n.pt --model head_s:head_s.pt --model head_m:head_m.pt --model SCUT_HEAD_n:Model_Compare/YOLOv8_head_detector-main/nano.pt --model SCUT_HEAD_m:Model_Compare/YOLOv8_head_detector-main/medium.pt --geom-model person2head_n:yolo11n.pt --geom-model person2head_s:yolo11s.pt --geom-model person2head_m:yolo11m.pt --domain catwalk:catwalk --domain helmet:helmet,test0706,test0707 --domain mixed:ultimateTest --imgsz 960 --conf 0.25

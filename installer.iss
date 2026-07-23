@@ -3,7 +3,7 @@
 ; torch is downloaded on the user's first launch, sized to their GPU.
 
 #define AppName "FACEBLUR"
-#define AppVersion "1.4"
+#define AppVersion "1.4.2"
 #define AppPublisher "werehappy"
 #define AppExeName "FACEBLUR.exe"
 
@@ -45,6 +45,14 @@ Source: "ffmpeg.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "head_n.pt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "head_s.pt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "head_m.pt"; DestDir: "{app}"; Flags: ignoreversion
+; Person prior models used by the tuned person->head rescue aid (v1.4.1):
+; head_n pairs with yolo11s, head_s/head_m with yolo11m. Bundled so the tuned
+; configuration works offline on first run; if absent the app auto-downloads
+; them (and falls back to yolo11n). "skipifsourcedoesntexist" keeps the build
+; from failing when a model is not present next to the script.
+Source: "yolo11n.pt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "yolo11s.pt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "yolo11m.pt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; Bundled embeddable Python (pip-capable, no torch yet). recursesubdirs
 ; copies the whole tree; torch lands inside it on first run.
 Source: "faceblur_env\*"; DestDir: "{app}\faceblur_env"; Flags: ignoreversion recursesubdirs createallsubdirs

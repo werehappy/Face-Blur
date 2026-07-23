@@ -136,9 +136,14 @@ def head_from_person(box, w_frac, aspect):
     return (cx - hw / 2.0, y1, cx + hw / 2.0, y1 + hh)
 
 
+IMG_SHAPES = {}  # abs_img_path -> (h, w), filled by load_gt_boxes for the
+                 # border/interior split (needs frame dims to test edge proximity)
+
+
 def load_gt_boxes(img_path, images_root, labels_root, shape):
     """Read YOLO-format labels for one image, return pixel xyxy boxes."""
     h, w = shape[0], shape[1]
+    IMG_SHAPES[os.path.abspath(img_path)] = (h, w)
     rel = os.path.relpath(img_path, images_root)
     stem = os.path.splitext(rel)[0]
     lbl = os.path.join(labels_root, stem + ".txt")
@@ -190,6 +195,126 @@ def match_image(preds, gts, iou_thr):
         else:
             out.append((conf, False))
     return out
+
+
+def _resample_keys(keys, level, rng):
+    """Return a resampled (with replacement) key list for one bootstrap draw.
+      clip  -- resample whole CLIPS (the honest default: heads within a clip are
+               correlated -- same person, lighting, consecutive frames -- so the
+               independent unit is the clip, not the head or frame). With C
+               clips, draw C clips with replacement and concatenate their keys.
+      image -- resample images with replacement (ignores within-clip correlation;
+               CIs will be too narrow -- provided only for comparison).
+    Duplicate keys are intentional: op_metrics/ap_at iterate the list and so a
+    doubled clip doubles its TP/FP/GT contribution, which is the correct
+    bootstrap behaviour.
+    """
+    if level == "image":
+        n = len(keys)
+        return [keys[rng.randrange(n)] for _ in range(n)]
+    # clip level
+    by_clip = {}
+    for k in keys:
+        by_clip.setdefault(clip_of(k), []).append(k)
+    clips = list(by_clip.keys())
+    c = len(clips)
+    out = []
+    for _ in range(c):
+        out.extend(by_clip[clips[rng.randrange(c)]])
+    return out
+
+
+def _percentile(sorted_vals, q):
+    """Linear-interpolated percentile (q in [0,1]) of a pre-sorted list."""
+    if not sorted_vals:
+        return float("nan")
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    pos = q * (len(sorted_vals) - 1)
+    lo = int(pos)
+    frac = pos - lo
+    if lo + 1 < len(sorted_vals):
+        return sorted_vals[lo] * (1 - frac) + sorted_vals[lo + 1] * frac
+    return sorted_vals[lo]
+
+
+def bootstrap_metric_cis(preds_by_img, gts_by_img, keys, conf, iou, n_boot,
+                         level, ci, seed, want_map=False):
+    """Bootstrap CIs for recall/precision/f1 (and optionally mAP50) over `keys`.
+    Returns {metric: (lo, hi)}. Metrics are recomputed with op_metrics/ap_at on
+    each resample, so the CI means exactly what the point estimate means."""
+    import random
+    rng = random.Random(seed)
+    acc = {"recall": [], "precision": [], "f1": [], "map50": []}
+    for _ in range(n_boot):
+        rk = _resample_keys(keys, level, rng)
+        r, p, f1, _ = op_metrics(preds_by_img, gts_by_img, rk, conf, iou)
+        acc["recall"].append(r); acc["precision"].append(p); acc["f1"].append(f1)
+        if want_map:
+            acc["map50"].append(ap_at(preds_by_img, gts_by_img, rk, 0.5))
+    lo_q, hi_q = (1 - ci) / 2, 1 - (1 - ci) / 2
+    out = {}
+    for m, vals in acc.items():
+        vals = [v for v in vals if v == v]  # drop NaN
+        if not vals:
+            out[m] = (float("nan"), float("nan"))
+            continue
+        vals.sort()
+        out[m] = (_percentile(vals, lo_q), _percentile(vals, hi_q))
+    return out
+
+
+def bootstrap_recall_ci(preds_by_img, gts_by_img, keys, conf, iou, n_boot,
+                        level, ci, seed):
+    """Recall-only bootstrap CI (for per-source / population rows)."""
+    return bootstrap_metric_cis(preds_by_img, gts_by_img, keys, conf, iou,
+                                n_boot, level, ci, seed, want_map=False)["recall"]
+
+
+def bootstrap_paired_delta_ci(base_preds, var_preds, gts_by_img, keys, conf, iou,
+                              n_boot, level, ci, seed, metric="recall"):
+    """CI for the DIFFERENCE (variant - base) of a metric, resampling the SAME
+    clips for both arms on each draw. This is the correct test for 'did the
+    augmentation help?': if the CI excludes 0, the improvement is significant at
+    the (1-ci) level. Returns (delta_point, lo, hi)."""
+    import random
+    rng = random.Random(seed)
+    def metric_of(preds, ks):
+        r, p, f1, _ = op_metrics(preds, gts_by_img, ks, conf, iou)
+        return {"recall": r, "precision": p, "f1": f1}[metric]
+    point = metric_of(var_preds, keys) - metric_of(base_preds, keys)
+    diffs = []
+    for _ in range(n_boot):
+        rk = _resample_keys(keys, level, rng)
+        d = metric_of(var_preds, rk) - metric_of(base_preds, rk)
+        if d == d:
+            diffs.append(d)
+    diffs.sort()
+    lo_q, hi_q = (1 - ci) / 2, 1 - (1 - ci) / 2
+    return point, _percentile(diffs, lo_q), _percentile(diffs, hi_q)
+
+
+def _ci_str(lo, hi):
+    if lo != lo or hi != hi:
+        return ""
+    return "[{:.3f}, {:.3f}]".format(lo, hi)
+
+
+def _attach_ci(args, preds_by_img, gts_by_img, keys, row, want_map=False):
+    """If bootstrap is on, compute CIs for this row's metrics over `keys` and
+    store them as recall_ci/precision_ci/f1_ci/map50_ci on the row dict."""
+    if getattr(args, "bootstrap", 0) <= 0:
+        return
+    cis = bootstrap_metric_cis(preds_by_img, gts_by_img,
+                               [os.path.abspath(k) for k in keys],
+                               args.conf, args.geom_iou, args.bootstrap,
+                               args.bootstrap_level, args.bootstrap_ci,
+                               args.bootstrap_seed, want_map=want_map)
+    row["recall_ci"] = cis["recall"]
+    row["precision_ci"] = cis["precision"]
+    row["f1_ci"] = cis["f1"]
+    if want_map:
+        row["map50_ci"] = cis["map50"]
 
 
 def op_metrics(preds_by_img, gts_by_img, keys, conf, iou_thr):
@@ -339,9 +464,11 @@ def eval_geom_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows)
                 aps = [a for a in aps if a == a]
                 map5095 = sum(aps) / len(aps) if aps else float("nan")
             n_heads = heads[dom] if dom != "ALL" else sum(heads.values())
-            rows.append(dict(model=name, domain=dom, images=len(paths), heads=n_heads,
+            _r = dict(model=name, domain=dom, images=len(paths), heads=n_heads,
                              recall=recall, precision=precision, f1=f1,
-                             map50=map50, map50_95=map5095))
+                             map50=map50, map50_95=map5095)
+            _attach_ci(args, preds_by_img, gts_by_img, paths, _r, want_map=not args.no_map)
+            rows.append(_r)
             print("  {:<12} R={} P={} F1={} mAP50={}".format(
                 dom, _fmt(recall), _fmt(precision), _fmt(f1), _fmt(map50)))
         model = None
@@ -458,6 +585,66 @@ def _edge_collect(model, img_path, args, floor, strip_op_conf):
     return _dedup_conf_desc(preds, 0.40), (h, w)
 
 
+def _is_border_gt(box, shape, margin):
+    """True if a GT head box touches the frame edge within `margin` (fraction of
+    the frame dimension). These are the frame-truncated heads that edge-strip
+    inference targets; everything else is 'interior'."""
+    h, w = shape
+    mx, my = margin * w, margin * h
+    x1, y1, x2, y2 = box
+    return (x1 <= mx or y1 <= my or x2 >= w - mx or y2 >= h - my)
+
+
+def _pop_recall(preds_by_img, gts_by_img, keys, conf, iou_thr, margin, border):
+    """Recall over ONLY the border (or interior) GT population. Predictions are
+    matched against the full GT set (so a pred matching an interior head is not
+    stolen by the border tally), then we count TPs whose matched GT is in the
+    requested population. Returns (recall, n_pop)."""
+    tp = n_pop = 0
+    for k in keys:
+        gts = gts_by_img.get(k, [])
+        shape = IMG_SHAPES.get(k)
+        if shape is None:
+            continue
+        flags = [_is_border_gt(g, shape, margin) for g in gts]
+        n_pop += sum(1 for fb in flags if fb == border)
+        preds = [p for p in preds_by_img.get(k, []) if p[0] >= conf]
+        # greedy conf-desc match to GT indices (mirror match_image, but keep the
+        # matched GT index so we can attribute each TP to its population)
+        order = sorted(range(len(preds)), key=lambda i: -preds[i][0])
+        matched = [False] * len(gts)
+        for i in order:
+            _c, pbox = preds[i]
+            best, best_iou = -1, iou_thr
+            for g, gt in enumerate(gts):
+                if matched[g]:
+                    continue
+                v = iou_xyxy(pbox, gt)
+                if v >= best_iou:
+                    best, best_iou = g, v
+            if best >= 0:
+                matched[best] = True
+                if flags[best] == border:
+                    tp += 1
+    recall = tp / n_pop if n_pop else float("nan")
+    return recall, n_pop
+
+
+def _append_pop_rows(args, preds_by_img, gts_by_img, keys, rows, row_name):
+    """Append two extra rows: border-touching and interior GT recall. Only the
+    ALL image set is used (populations are geometric, not per-domain). Guarded by
+    --edge-margin > 0."""
+    if getattr(args, "edge_margin", 0) <= 0:
+        return
+    for border, tag in ((True, "border"), (False, "interior")):
+        rec, n_pop = _pop_recall(preds_by_img, gts_by_img, keys,
+                                 args.conf, args.geom_iou, args.edge_margin, border)
+        rows.append(dict(model=row_name, domain=tag, images=len(keys), heads=n_pop,
+                         recall=rec, precision=float("nan"), f1=float("nan"),
+                         map50=float("nan"), map50_95=float("nan")))
+        print("  {:<12} R={} (n={})".format(tag, _fmt(rec), n_pop))
+
+
 def _score_rows(args, preds_by_img, gts_by_img, eval_sets, heads, rows, row_name):
     """Score one prediction set over every domain subset and append rows."""
     for dom, paths in eval_sets:
@@ -476,6 +663,9 @@ def _score_rows(args, preds_by_img, gts_by_img, eval_sets, heads, rows, row_name
                          map50=map50, map50_95=map5095))
         print("  {:<12} R={} P={} F1={} mAP50={}".format(
             dom, _fmt(recall), _fmt(precision), _fmt(f1), _fmt(map50)))
+    _append_pop_rows(args, preds_by_img, gts_by_img,
+                     [os.path.abspath(p) for p in dict(eval_sets)["ALL"]],
+                     rows, row_name)
 
 
 def eval_combo_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows, priors_by_img=None):
@@ -558,6 +748,7 @@ def eval_fused_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows
             name, weights, args.fuse_floor, args.fuse_alpha, args.fuse_beta))
         model = YOLO(weights)
         preds_by_img, gts_by_img = {}, {}
+        base_by_img = {}   # candidates WITHOUT the prior (for the paired delta)
         # per-image predict; see eval_geom_models for why the list form is unsafe
         for img_path in imgs:
             res = model.predict(img_path, imgsz=args.imgsz, conf=args.fuse_floor,
@@ -566,6 +757,7 @@ def eval_fused_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows
             priors = priors_by_img.get(key, [])
             preds = []
             head_boxes = []
+            base_here = []
             if res.boxes is not None and len(res.boxes):
                 confs = res.boxes.conf.detach().cpu().tolist()
                 xyxys = res.boxes.xyxy.detach().cpu().tolist()
@@ -574,12 +766,14 @@ def eval_fused_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows
                     ov = _prior_overlap(hb, priors)
                     preds.append((min(1.0, float(c) * (1.0 + args.fuse_alpha * ov)), hb))
                     head_boxes.append(hb)
+                    base_here.append((float(c), hb))   # unrescored candidate
             # unclaimed priors -> weak geometry-only boxes (never full conf:
             # gear-forward poses misplace the region, see face_blur.py notes)
             for pc, pb in priors:
                 if all(iou_xyxy(pb, hb) < 0.30 for hb in head_boxes):
                     preds.append((pc * args.fuse_beta, pb))
             preds_by_img[key] = preds
+            base_by_img[key] = base_here
             gts_by_img[key] = load_gt_boxes(img_path, images_dir, labels_dir, res.orig_shape)
             del res
             if _cuda:
@@ -595,11 +789,33 @@ def eval_fused_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows
                 aps = [a for a in aps if a == a]
                 map5095 = sum(aps) / len(aps) if aps else float("nan")
             n_heads = heads[dom] if dom != "ALL" else sum(heads.values())
-            rows.append(dict(model=name + "+prior", domain=dom, images=len(paths), heads=n_heads,
+            _r = dict(model=name + "+prior", domain=dom, images=len(paths), heads=n_heads,
                              recall=recall, precision=precision, f1=f1,
-                             map50=map50, map50_95=map5095))
+                             map50=map50, map50_95=map5095)
+            _attach_ci(args, preds_by_img, gts_by_img, paths, _r, want_map=not args.no_map)
+            rows.append(_r)
             print("  {:<12} R={} P={} F1={} mAP50={}".format(
                 dom, _fmt(recall), _fmt(precision), _fmt(f1), _fmt(map50)))
+        _append_pop_rows(args, preds_by_img, gts_by_img,
+                         [os.path.abspath(p) for p in dict(eval_sets)["ALL"]],
+                         rows, name + "+prior")
+        # Paired significance test: does the prior significantly change recall/
+        # precision vs the same model WITHOUT rescoring, on the same resampled
+        # clips? If the CI excludes 0 the effect is significant at (1-ci).
+        if getattr(args, "bootstrap", 0) > 0:
+            allk = [os.path.abspath(p) for p in dict(eval_sets)["ALL"]]
+            for metric in ("recall", "precision"):
+                pt, lo, hi = bootstrap_paired_delta_ci(
+                    base_by_img, preds_by_img, gts_by_img, allk, args.conf,
+                    args.geom_iou, args.bootstrap, args.bootstrap_level,
+                    args.bootstrap_ci, args.bootstrap_seed, metric=metric)
+                sig = "significant" if (lo > 0 or hi < 0) else "n.s. (CI spans 0)"
+                print("  [delta] {} {}: {:+.3f}  {:.0%} CI [{:+.3f}, {:+.3f}]  {}".format(
+                    name + "+prior", metric, pt, args.bootstrap_ci, lo, hi, sig))
+                rows.append(dict(model=name + "+prior\u0394", domain=metric,
+                                 images="", heads="", recall=pt, precision="",
+                                 f1="", map50="", map50_95="",
+                                 recall_ci=(lo, hi)))
         model = None
         _free_cuda()
         _report_vram("after releasing " + name)
@@ -702,11 +918,16 @@ def eval_edge_models(args, imgs, eval_sets, heads, images_dir, labels_dir, rows)
                 aps = [a for a in aps if a == a]
                 map5095 = sum(aps) / len(aps) if aps else float("nan")
             n_heads = heads[dom] if dom != "ALL" else sum(heads.values())
-            rows.append(dict(model=name + "+edge", domain=dom, images=len(paths), heads=n_heads,
+            _r = dict(model=name + "+edge", domain=dom, images=len(paths), heads=n_heads,
                              recall=recall, precision=precision, f1=f1,
-                             map50=map50, map50_95=map5095))
+                             map50=map50, map50_95=map5095)
+            _attach_ci(args, preds_by_img, gts_by_img, paths, _r, want_map=not args.no_map)
+            rows.append(_r)
             print("  {:<12} R={} P={} F1={} mAP50={}".format(
                 dom, _fmt(recall), _fmt(precision), _fmt(f1), _fmt(map50)))
+        _append_pop_rows(args, preds_by_img, gts_by_img,
+                         [os.path.abspath(p) for p in dict(eval_sets)["ALL"]],
+                         rows, name + "+edge")
 
 
 def evaluate(model, tmp_yaml, imgsz, device, conf):
@@ -777,6 +998,25 @@ def collect_rows(args):
         print("\n=== model: {} ({}) ===".format(name, weights))
         model = YOLO(weights)
 
+        # For bootstrap CIs and/or the border/interior split the base model needs
+        # per-box predictions (ultralytics .val() does not expose them). Run ONE
+        # predict pass up front and reuse it; otherwise skip for speed.
+        base_preds_by_img = base_gts_by_img = None
+        if getattr(args, "bootstrap", 0) > 0 or getattr(args, "edge_margin", 0) > 0:
+            base_preds_by_img, base_gts_by_img = {}, {}
+            for p in imgs:
+                k = os.path.abspath(p)
+                res = model.predict(p, imgsz=args.imgsz, conf=args.conf,
+                                    device=args.device, verbose=False)[0]
+                pr = []
+                if res.boxes is not None and len(res.boxes):
+                    cs = res.boxes.conf.detach().cpu().tolist()
+                    bs = res.boxes.xyxy.detach().cpu().tolist()
+                    pr = [(float(c), tuple(b)) for c, b in zip(cs, bs)]
+                base_preds_by_img[k] = pr
+                base_gts_by_img[k] = load_gt_boxes(p, images_dir, labels_dir, res.orig_shape)
+                del res
+
         for dom, paths in eval_sets:
             list_txt = os.path.join(tmpdir, "imgs_{}_{}.txt".format(name, dom.strip("()")))
             with open(list_txt, "w") as f:
@@ -798,12 +1038,23 @@ def collect_rows(args):
             f1 = (2 * precision * recall / (precision + recall)
                   if (precision == precision and recall == recall and (precision + recall)) else float("nan"))
             n_heads = heads[dom] if dom != "ALL" else sum(heads.values())
-            rows.append(dict(model=name, domain=dom, images=len(paths), heads=n_heads,
+            _r = dict(model=name, domain=dom, images=len(paths), heads=n_heads,
                              recall=recall, precision=precision, f1=f1,
-                             map50=map50, map50_95=map5095))
+                             map50=map50, map50_95=map5095)
+            if base_preds_by_img is not None:
+                _attach_ci(args, base_preds_by_img, base_gts_by_img, paths, _r,
+                           want_map=not args.no_map)
+            rows.append(_r)
             print("  {:<12} R={} P={} F1={} mAP50={}".format(
                 dom, _fmt(recall), _fmt(precision), _fmt(f1), _fmt(map50)))
+
+        # Border/interior populations for the BASE model (reuses the up-front
+        # predict pass built above; only emitted when --edge-margin > 0).
+        if getattr(args, "edge_margin", 0) > 0 and base_preds_by_img is not None:
+            _append_pop_rows(args, base_preds_by_img, base_gts_by_img,
+                             [os.path.abspath(p) for p in imgs], rows, name)
         model = None
+        base_preds_by_img = base_gts_by_img = None
         _free_cuda()
         _report_vram("after releasing " + name)
 
@@ -832,11 +1083,29 @@ def _fmt(v, nd=3):
 
 def write_csv(rows, path):
     fields = ["model", "domain", "images", "heads", "recall", "precision", "f1", "map50", "map50_95"]
+    # add CI columns only if any row carries them
+    has_ci = any("recall_ci" in r for r in rows)
+    ci_fields = []
+    if has_ci:
+        ci_fields = ["recall_lo", "recall_hi", "precision_lo", "precision_hi",
+                     "f1_lo", "f1_hi", "map50_lo", "map50_hi"]
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=fields + ci_fields)
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in fields})
+            row = {k: r.get(k, "") for k in fields}
+            if has_ci:
+                for m, lo, hi in (("recall_ci", "recall_lo", "recall_hi"),
+                                  ("precision_ci", "precision_lo", "precision_hi"),
+                                  ("f1_ci", "f1_lo", "f1_hi"),
+                                  ("map50_ci", "map50_lo", "map50_hi")):
+                    v = r.get(m)
+                    if v and v[0] == v[0]:
+                        row[lo] = "{:.4f}".format(v[0])
+                        row[hi] = "{:.4f}".format(v[1])
+                    else:
+                        row[lo] = row[hi] = ""
+            w.writerow(row)
 
 
 def _models_in_order(rows):
@@ -979,6 +1248,23 @@ def main():
                     help="name:weights evaluated with edge strips AND the person->head prior "
                          "together -- the app's runtime configuration (repeatable). Rows: "
                          "'<name>+edge+prior'. Uses the --edge-* and --fuse-* parameters.")
+    ap.add_argument("--bootstrap", type=int, default=0,
+                    help="if > 0, add bootstrap confidence intervals to every "
+                         "recall/precision/f1 (and mAP) figure, using this many "
+                         "resamples (e.g. 1000). Off by default.")
+    ap.add_argument("--bootstrap-level", choices=["clip", "image"], default="clip",
+                    help="bootstrap resampling unit (default clip: the honest "
+                         "choice, since heads within a clip are correlated).")
+    ap.add_argument("--bootstrap-ci", type=float, default=0.95,
+                    help="confidence level for the intervals (default 0.95)")
+    ap.add_argument("--bootstrap-seed", type=int, default=0,
+                    help="RNG seed for reproducible intervals (default 0)")
+    ap.add_argument("--edge-margin", type=float, default=0.0,
+                    help="if > 0, also report border-touching vs interior GT "
+                         "recall (fraction of frame dim within which a GT box "
+                         "counts as frame-truncated; try 0.02). Adds 'border' "
+                         "and 'interior' rows per model to the CSV. The base "
+                         "model gets one extra predict pass to compute these.")
     ap.add_argument("--edge", action="append", dest="edge", type=parse_model, default=[],
                     help="name:weights of a head model to evaluate WITH the app's "
                          "edge-strip pass (repeatable). Produces rows named '<name>+edge'; "

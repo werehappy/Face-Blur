@@ -1,0 +1,8 @@
+1.3 Contributions
+person -> head 설명 잘못됨 - 수정
+
+3.1
+Head detection인데 Face얘기가 더 많이 나옴 - 수정
+
+4.3
+person->head is not a runtime fallback but more of a heatmap aid

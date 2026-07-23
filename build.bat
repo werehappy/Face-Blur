@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 echo.
 echo ==================================================
-echo   FACEBLUR v1.3  --  Dev Build
+echo   FACEBLUR v1.4.1  --  Dev Build
 echo ==================================================
 echo.
 
@@ -124,6 +124,14 @@ if "%_HEAD_OK%"=="1" (
 ) else (
     echo [WARN] no head_n/s/m.pt found - app will fall back to head_default.pt.
 )
+
+:: Person prior models for the tuned rescue aid (v1.4.1): head_n->yolo11s,
+:: head_s/head_m->yolo11m. Copy any present next to the dev exe so the tuned
+:: config works without a runtime download; the app fetches missing ones.
+for %%P in (yolo11n.pt yolo11s.pt yolo11m.pt) do (
+    if exist "%~dp0%%P" copy /y "%~dp0%%P" "%~dp0dist\%%P" >nul
+)
+echo       person prior model(s) copied to dist\ ^(if present^).
 
 echo.
 echo ==================================================
